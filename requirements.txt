@@ -1,0 +1,4 @@
+# The tool uses the AWS SDK for Python (boto3). Control Tower baseline APIs
+# (ListEnabledBaselines / GetLandingZone drift status) require a reasonably
+# recent botocore, so a modern boto3 is pinned as the floor.
+boto3>=1.34.0
