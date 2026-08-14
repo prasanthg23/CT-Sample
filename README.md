@@ -211,6 +211,21 @@ RESULT: NOT SAFE TO UPGRADE — 2 blocker(s), 0 warning(s), 0 unverified.
 3. **Report + gate** — Prints a grouped report (and optional JSON), then exits non-zero if any
    blocker (or, with `--strict`, any warning/unknown) is present.
 
+## Testing
+
+The blocker-detection logic is proven offline with a mocked-response harness — no AWS account
+or network needed. It feeds each check simulated good/bad API responses and asserts the correct
+severity fires (e.g. DRIFTED → BLOCKER, OUTDATED StackSet → INFO, unreachable shared account →
+UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
+
+```bash
+python3 tests/test_blocker_paths.py      # 29 tests, plain unittest (no extra deps)
+```
+
+This complements a live run against a healthy landing zone (which only exercises the PASS/INFO
+paths): the harness proves the BLOCKER/WARNING/UNKNOWN paths without needing a broken
+environment.
+
 ## Limitations and scope
 
 This tool reduces upgrade failures; it does not guarantee success. Be aware of the following:
