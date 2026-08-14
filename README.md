@@ -71,7 +71,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 5 | Orphaned provisioned products | Suspended account still holding an Account Factory product (→ `AWSControlTowerExecution` can't be assumed) | `organizations:ListAccounts` + `servicecatalog:SearchProvisionedProducts` | BLOCKER |
 | 6 | Enabled controls drift | Drifted / non-`SUCCEEDED` controls across every registered OU | `organizations` (OU discovery) + `controltower:ListEnabledControls` | BLOCKER |
 | 7 | Enabled baselines drift | Drifted / non-`SUCCEEDED` baselines incl. child accounts | `controltower:ListEnabledBaselines` (`includeChildren=true`) | BLOCKER |
-| 8 | StackSet health | `AWSControlTower*` stack instances outdated/inoperable/drifted/orphaned | `cloudformation:ListStackSets` / `ListStackInstances` | BLOCKER |
+| 8 | StackSet health | `AWSControlTower*` stack instances INOPERABLE/FAILED/DRIFTED (OUTDATED is reported as INFO — it is normal before an update) | `cloudformation:ListStackSets` / `ListStackInstances` | BLOCKER / INFO |
 | 9 | AWS Config in shared accounts | Extra/foreign Config recorders in Audit & Log Archive (and non-home Regions) | `sts:AssumeRole` + `config:DescribeConfigurationRecorders` | WARNING |
 | 10 | Customizations | CfCT / AFT / custom StackSets targeting governed Regions | `cloudformation` / `organizations` | INFO |
 | 11 | Trusted access | Required Organizations trusted service access disabled | `organizations:ListAWSServiceAccessForOrganization` | BLOCKER |
@@ -79,7 +79,8 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 13 | Required IAM roles | Missing CT management-account service roles | `iam:GetRole` | BLOCKER |
 | 14 | KMS key state | LZ customer-managed key disabled / pending deletion | `kms:DescribeKey` | BLOCKER |
 | 15 | STS regional activation | STS deactivated in a governed Region (update fails midway) | `sts:GetCallerIdentity` (per Region) | BLOCKER |
-| 16 | SCP headroom | Target at/near the 5-SCP limit + custom SCP inventory | `organizations:ListPoliciesForTarget` | WARNING |
+| 16 | SCP headroom | Target at/near the 10-SCP limit + custom SCP inventory | `organizations:ListPoliciesForTarget` | WARNING |
+| 17 | SCP blocking content | `FullAWSAccess` detached; custom Deny not exempting `AWSControlTowerExecution`; Region restriction via SCP | `organizations:ListPoliciesForTarget` / `DescribePolicy` | WARNING |
 
 The required CT management-account IAM roles verified by check #13 are:
 `AWSControlTowerAdmin`, `AWSControlTowerCloudTrailRole`, `AWSControlTowerStackSetRole`,
@@ -107,6 +108,7 @@ The required CT management-account IAM roles verified by check #13 are:
         "organizations:ListAccounts",
         "organizations:ListPolicies",
         "organizations:ListPoliciesForTarget",
+        "organizations:DescribePolicy",
         "organizations:ListAWSServiceAccessForOrganization",
         "organizations:ListDelegatedAdministrators",
         "organizations:ListDelegatedServicesForAccount",

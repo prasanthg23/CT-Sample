@@ -31,7 +31,9 @@ WHAT IT CHECKS  (each mapped to a documented LZ-update failure cause; see README
     13. Required Control Tower management-account IAM roles exist
     14. Landing-zone KMS key is ENABLED (not disabled / pending deletion)
     15. STS is activated in the management account for every governed Region
-    16. SCP headroom (5-SCP-per-target limit) + customer-managed SCP inventory
+    16. SCP headroom (10-SCP-per-target limit) + customer-managed SCP inventory
+    17. SCP content risk: FullAWSAccess detached, or a custom Deny that doesn't exempt
+        AWSControlTowerExecution / restricts Regions via SCP (can block the update)
 
 USAGE
 -----
@@ -58,7 +60,7 @@ REQUIRED PERMISSIONS (management account, read-only)
     organizations:DescribeOrganization, ListRoots, ListOrganizationalUnitsForParent,
                   ListAccounts, ListPolicies, ListPoliciesForTarget,
                   ListAWSServiceAccessForOrganization, ListDelegatedAdministrators,
-                  ListDelegatedServicesForAccount
+                  ListDelegatedServicesForAccount, DescribePolicy
     servicecatalog:SearchProvisionedProducts
     cloudformation:ListStackSets, DescribeStackSet, ListStackInstances, ListStacks
     iam:GetRole
@@ -131,9 +133,14 @@ DOC = "https://docs.aws.amazon.com/controltower/latest/userguide"
 # Helper: paginate any boto3 call safely
 # --------------------------------------------------------------------------------------
 def _collect(client, op: str, key: str, **kwargs) -> List[dict]:
-    """Depaginate op if a paginator exists, else single call. Returns list under `key`."""
+    """Depaginate op if a paginator exists, else single call. Returns list under `key`.
+    Robust against older botocore where can_paginate() raises for unknown operations."""
     out: List[dict] = []
-    if client.can_paginate(op):
+    try:
+        paginable = client.can_paginate(op)
+    except Exception:
+        paginable = False
+    if paginable:
         for page in client.get_paginator(op).paginate(**kwargs):
             out.extend(page.get(key, []))
     else:
@@ -169,6 +176,15 @@ class Context:
         except (ClientError, BotoCoreError) as e:
             report.add(Finding("discovery", UNKNOWN,
                                "Could not determine caller identity", str(e)))
+            return False
+
+        # Preflight: the SDK must be new enough to know the Control Tower LZ APIs.
+        if not hasattr(self.ct, "list_landing_zones"):
+            report.add(Finding("discovery", BLOCKER,
+                               "Installed boto3/botocore is too old for Control Tower APIs",
+                               "This SDK does not expose controltower:ListLandingZones / "
+                               "GetLandingZone / ListEnabledBaselines.",
+                               remediation="Upgrade the SDK:  pip install -U 'boto3>=1.34'"))
             return False
 
         try:
@@ -452,26 +468,43 @@ def check_stacksets(ctx: Context, report: Report) -> None:
         report.add(Finding("stacksets", UNKNOWN,
                            "Could not list CloudFormation StackSets", str(e)))
         return
-    bad = []
+    bad, outdated = [], []
     for name in names:
         try:
             insts = _collect(cfn, "list_stack_instances", "Summaries", StackSetName=name)
         except (ClientError, BotoCoreError):
             continue
         for i in insts:
-            status = i.get("Status") or (i.get("StackInstanceStatus") or {}).get("DetailedStatus")
+            status = i.get("Status")  # summary status: CURRENT | OUTDATED | INOPERABLE
+            detailed = (i.get("StackInstanceStatus") or {}).get("DetailedStatus")
             drift = i.get("DriftStatus")
-            if status not in ("CURRENT", None) or drift == "DRIFTED":
-                bad.append([name, i.get("Account", ""), i.get("Region", ""),
-                            str(status), str(drift)])
+            row = [name, i.get("Account", ""), i.get("Region", ""),
+                   str(status or detailed), str(drift)]
+            # Real blockers: an instance that can't be updated, failed, or has drifted.
+            if status == "INOPERABLE" or detailed in ("FAILED", "INOPERABLE", "CANCELLED"):
+                bad.append(row)
+            elif drift == "DRIFTED":
+                bad.append(row)
+            elif status == "OUTDATED":
+                # Expected when an LZ update is pending — the update refreshes these.
+                outdated.append(row)
     if bad:
         report.add(Finding("stacksets", BLOCKER,
-                           f"{len(bad)} AWSControlTower* StackSet instance(s) unhealthy/drifted",
-                           "OUTDATED/INOPERABLE/DRIFTED or orphaned stack instances cause the "
-                           "landing-zone update to fail.",
+                           f"{len(bad)} AWSControlTower* StackSet instance(s) inoperable/failed/drifted",
+                           "INOPERABLE/FAILED or DRIFTED stack instances cause the landing-zone "
+                           "update to fail. (OUTDATED instances are not counted here — that state "
+                           "is normal before an update.)",
                            cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=bad,
                            remediation="Repair or remove (Retain Stacks) the affected instances "
                                        "before upgrading."))
+    elif outdated:
+        report.add(Finding("stacksets", INFO,
+                           f"{len(outdated)} StackSet instance(s) are OUTDATED (expected)",
+                           "OUTDATED means the instances are behind the current template — this is "
+                           "normal when a landing-zone update is pending, and the update will "
+                           "refresh them. No inoperable/failed/drifted instances were found.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift"],
+                           rows=outdated[:50]))
     else:
         report.add(Finding("stacksets", PASS,
                            f"All instances CURRENT across {len(names)} AWSControlTower StackSet(s)"))
@@ -736,9 +769,9 @@ def check_sts_regional_activation(ctx: Context, report: Report) -> None:
 
 
 def check_scp_headroom(ctx: Context, report: Report) -> None:
-    """AWS Organizations allows a maximum of 5 SCPs attached per OU/account. If a governed OU
-    is at/near the limit, Control Tower may be unable to attach/update its managed SCP during
-    the upgrade. Also inventories customer-managed SCPs on governed OUs."""
+    """AWS Organizations allows a maximum of 10 SCPs attached per root/OU/account (hard limit;
+    increased from 5). If a governed OU is at/near the limit, Control Tower may be unable to
+    attach/update its managed SCP during the upgrade. Also inventories customer-managed SCPs."""
     try:
         ous = ctx.all_ou_arns()
         roots = _collect(ctx.orgs, "list_roots", "Roots")
@@ -757,37 +790,135 @@ def check_scp_headroom(ctx: Context, report: Report) -> None:
             continue
         checked += 1
         count = len(scps)
-        if count >= 5:
+        if count >= 10:
             at_limit.append([t["Name"], str(count)])
-        elif count == 4:
+        elif count >= 8:
             near_limit.append([t["Name"], str(count)])
         for p in scps:
-            if not p.get("AwsManaged", False) and p.get("Name") != "FullAWSAccess":
-                custom_rows.append([t["Name"], p.get("Name", ""), p.get("Id", "")])
+            name = p.get("Name", "")
+            # aws-guardrails-* are Control Tower's own managed preventive-control SCPs
+            # (they report AwsManaged=false because CT creates them in your account).
+            # Count them toward the SCP limit, but do not label them "customer-managed".
+            is_ct_managed = name.startswith("aws-guardrails")
+            if not p.get("AwsManaged", False) and name != "FullAWSAccess" and not is_ct_managed:
+                custom_rows.append([t["Name"], name, p.get("Id", "")])
     if not checked:
         report.add(Finding("scp_headroom", UNKNOWN, "No targets queryable for SCPs"))
         return
     if at_limit:
         report.add(Finding("scp_headroom", WARNING,
-                           f"{len(at_limit)} target(s) at the 5-SCP attachment limit",
-                           "AWS Organizations allows max 5 SCPs per target. A target at the "
-                           "limit can prevent Control Tower from attaching/updating its managed "
-                           "SCP during the upgrade.",
+                           f"{len(at_limit)} target(s) at the 10-SCP attachment limit",
+                           "AWS Organizations allows max 10 SCPs per target (hard limit). A "
+                           "target at the limit can prevent Control Tower from attaching/updating "
+                           "its managed SCP during the upgrade.",
                            cols=["Target", "SCPs attached"], rows=at_limit + near_limit,
                            remediation="Consolidate or detach a custom SCP to free a slot."))
     elif near_limit:
         report.add(Finding("scp_headroom", WARNING,
-                           f"{len(near_limit)} target(s) near the 5-SCP limit (4 attached)",
+                           f"{len(near_limit)} target(s) near the 10-SCP limit (8+ attached)",
                            cols=["Target", "SCPs attached"], rows=near_limit))
     else:
         report.add(Finding("scp_headroom", PASS,
-                           f"All {checked} targets have SCP headroom (<4 attached)"))
+                           f"All {checked} targets have SCP headroom (<8 of 10 attached)"))
     if custom_rows:
         report.add(Finding("scp_custom", INFO,
                            f"{len(custom_rows)} customer-managed SCP attachment(s) on governed targets",
                            "Review custom SCPs before upgrading; ensure they do not conflict "
                            "with the controls the new landing-zone version will apply.",
                            cols=["Target", "SCP Name", "SCP Id"], rows=custom_rows[:100]))
+
+
+def check_scp_blocking(ctx: Context, report: Report) -> None:
+    """SCP *content* can block a Control Tower update, per AWS guidance:
+      - The `FullAWSAccess` SCP must remain attached (its removal breaks CT access).
+      - A custom Deny that does not exempt the AWSControlTowerExecution role can block
+        the operations CT performs in member accounts during the update.
+      - Restricting Regions via SCP (instead of the CT Region deny control) puts CT in an
+        'undefined state'.
+    This is a heuristic (it does not fully simulate policy evaluation), so risky SCPs are
+    reported as WARNING for human review, not auto-BLOCKER."""
+    try:
+        ous = ctx.all_ou_arns()
+        roots = _collect(ctx.orgs, "list_roots", "Roots")
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("scp_blocking", UNKNOWN, "Could not enumerate targets for SCP content check", str(e)))
+        return
+    targets = [{"Id": r["Id"], "Name": f"(root) {r.get('Name', r['Id'])}"} for r in roots]
+    targets += [{"Id": o["Id"], "Name": o["Name"]} for o in ous]
+
+    missing_fullaccess, risky = [], []
+    doc_cache: Dict[str, Any] = {}
+    checked = 0
+    for t in targets:
+        try:
+            scps = _collect(ctx.orgs, "list_policies_for_target", "Policies",
+                            TargetId=t["Id"], Filter="SERVICE_CONTROL_POLICY")
+        except (ClientError, BotoCoreError):
+            continue
+        checked += 1
+        names = {p.get("Name", "") for p in scps}
+        if "FullAWSAccess" not in names:
+            missing_fullaccess.append([t["Name"]])
+        for p in scps:
+            name = p.get("Name", "")
+            pid = p.get("Id", "")
+            # Skip AWS-managed FullAWSAccess and Control Tower's own guardrail SCPs.
+            if name == "FullAWSAccess" or name.startswith("aws-guardrails") or p.get("AwsManaged"):
+                continue
+            if pid not in doc_cache:
+                try:
+                    pol = ctx.orgs.describe_policy(PolicyId=pid)["Policy"]
+                    doc_cache[pid] = pol.get("Content", "")
+                except (ClientError, BotoCoreError):
+                    doc_cache[pid] = None
+            content = doc_cache.get(pid)
+            if not content:
+                continue
+            try:
+                doc = json.loads(content)
+            except (ValueError, TypeError):
+                continue
+            stmts = doc.get("Statement", [])
+            if isinstance(stmts, dict):
+                stmts = [stmts]
+            for stmt in stmts:
+                if stmt.get("Effect") != "Deny":
+                    continue
+                blob = json.dumps(stmt)
+                exempts_ct = "AWSControlTowerExecution" in blob
+                restricts_region = "aws:RequestedRegion" in blob
+                if not exempts_ct:
+                    reason = ("Deny does not exempt AWSControlTowerExecution"
+                              + ("; also restricts Regions" if restricts_region else ""))
+                    risky.append([t["Name"], name, reason])
+                    break  # one row per SCP/target is enough
+                elif restricts_region:
+                    risky.append([t["Name"], name, "Region restriction via SCP (use CT Region deny)"])
+                    break
+    if not checked:
+        report.add(Finding("scp_blocking", UNKNOWN, "No targets queryable for SCP content"))
+        return
+    if missing_fullaccess:
+        report.add(Finding("scp_blocking", WARNING,
+                           f"FullAWSAccess SCP not attached to {len(missing_fullaccess)} target(s)",
+                           "AWS Control Tower expects the FullAWSAccess SCP to remain attached; "
+                           "its removal can cut off access that CT needs during the update.",
+                           cols=["Target"], rows=missing_fullaccess,
+                           remediation="Re-attach the AWS-managed FullAWSAccess SCP to the target."))
+    if risky:
+        report.add(Finding("scp_blocking", WARNING,
+                           f"{len(risky)} custom SCP attachment(s) may block Control Tower",
+                           "These custom SCPs contain a Deny that does not exempt the "
+                           "AWSControlTowerExecution role, or restrict Regions via SCP. Either can "
+                           "cause the update to fail. Verify they exempt CT (ArnNotLike on "
+                           "aws:PrincipalARN) or move Region restriction to the CT Region deny control.",
+                           cols=["Target", "SCP", "Risk"], rows=risky,
+                           remediation="Add an AWSControlTowerExecution exemption, or detach the SCP "
+                                       "for the upgrade. See the CT SCP guidance."))
+    if not missing_fullaccess and not risky:
+        report.add(Finding("scp_blocking", PASS,
+                           f"FullAWSAccess present and no CT-blocking custom SCP patterns "
+                           f"found across {checked} target(s)"))
 
 
 CHECKS = [
@@ -807,6 +938,7 @@ CHECKS = [
     check_kms_key,
     check_sts_regional_activation,
     check_scp_headroom,
+    check_scp_blocking,
 ]
 
 
