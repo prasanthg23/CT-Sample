@@ -477,8 +477,12 @@ def check_stacksets(ctx: Context, report: Report) -> None:
         org_ids = {a["Id"] for a in _collect(ctx.orgs, "list_accounts", "Accounts")}
     except (ClientError, BotoCoreError):
         org_ids = None  # couldn't verify membership; don't suppress anything
+    # Shared/core accounts (management, log archive, audit) are what a landing-zone
+    # update/repair/reset actually acts on; member accounts are updated separately
+    # afterward (Re-register OU). So only shared-account instances are hard blockers.
+    shared = {a for a in (ctx.mgmt_account, ctx.audit_account, ctx.log_archive_account) if a}
 
-    bad, outdated, orphaned = [], [], []
+    shared_bad, member_bad, outdated, orphaned = [], [], [], []
     for name in names:
         try:
             insts = _collect(cfn, "list_stack_instances", "Summaries", StackSetName=name)
@@ -499,23 +503,35 @@ def check_stacksets(ctx: Context, report: Report) -> None:
             if org_ids is not None and acct and acct not in org_ids:
                 orphaned.append(row)
                 continue
-            # Real blockers: an instance that can't be updated, failed, or has drifted.
-            if status == "INOPERABLE" or detailed in ("FAILED", "INOPERABLE", "CANCELLED"):
-                bad.append(row)
-            elif drift == "DRIFTED":
-                bad.append(row)
+            is_bad = (status == "INOPERABLE"
+                      or detailed in ("FAILED", "INOPERABLE", "CANCELLED")
+                      or drift == "DRIFTED")
+            if is_bad:
+                (shared_bad if acct in shared else member_bad).append(row)
             elif status == "OUTDATED":
                 # Expected when an LZ update is pending — the update refreshes these.
                 outdated.append(row)
-    if bad:
+    if shared_bad:
         report.add(Finding("stacksets", BLOCKER,
-                           f"{len(bad)} AWSControlTower* StackSet instance(s) inoperable/failed/drifted",
-                           "INOPERABLE/FAILED or DRIFTED stack instances in accounts still enrolled in "
-                           "the org cause the landing-zone update to fail. (OUTDATED instances, and "
-                           "instances for accounts no longer in the org, are not counted here.)",
-                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=bad,
-                           remediation="Repair or remove (Retain Stacks) the affected instances "
-                                       "before upgrading."))
+                           f"{len(shared_bad)} AWSControlTower* StackSet instance(s) inoperable/failed/"
+                           "drifted in shared accounts",
+                           "INOPERABLE/FAILED or DRIFTED instances in the management, log archive, or "
+                           "audit accounts block the landing-zone update — those accounts are exactly "
+                           "what the update/repair/reset acts on.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=shared_bad,
+                           remediation="Repair or remove (Retain Stacks) the affected shared-account "
+                                       "instances before upgrading."))
+    if member_bad:
+        report.add(Finding("stacksets_member", WARNING,
+                           f"{len(member_bad)} AWSControlTower* StackSet instance(s) inoperable/failed/"
+                           "drifted in member accounts",
+                           "These are in member (non-shared) accounts. A landing-zone update/repair/reset "
+                           "acts on the shared accounts first and does not touch member accounts, so this "
+                           "does NOT block the landing-zone update. It can, however, affect that account "
+                           "when you later update/re-register its OU — worth reconciling.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=member_bad,
+                           remediation="Reconcile (repair/revert) before you update or re-register that "
+                                       "account's OU."))
     if orphaned:
         report.add(Finding("stacksets_orphaned", INFO,
                            f"{len(orphaned)} stale StackSet instance(s) target accounts no longer in the org",
@@ -525,7 +541,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                            cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=orphaned[:50],
                            remediation="Optionally delete these stale instances "
                                        "(DeleteStackInstances with RetainStacks) to tidy up."))
-    if not bad:
+    if not shared_bad and not member_bad:
         if outdated:
             report.add(Finding("stacksets", INFO,
                                f"{len(outdated)} StackSet instance(s) are OUTDATED (expected)",
@@ -623,7 +639,8 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                 break
             time.sleep(10)
 
-    drifted, orphaned_drifted = [], []
+    shared = {a for a in (ctx.mgmt_account, ctx.audit_account, ctx.log_archive_account) if a}
+    shared_drifted, member_drifted, orphaned_drifted = [], [], []
     for name in names:
         try:
             insts = _collect(cfn, "list_stack_instances", "Summaries", StackSetName=name)
@@ -637,23 +654,38 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
             status = str(i.get("Status") or (i.get("StackInstanceStatus") or {}).get("DetailedStatus"))
             if org_ids is not None and acct and acct not in org_ids:
                 orphaned_drifted.append([name, acct, region, status, "DRIFTED"])
-            else:
-                # Drill into what actually drifted (assume role); fall back if the
-                # AWSControlTowerExecution role isn't there.
-                detail = _resource_drift_detail(ctx, acct, region, i.get("StackId"))
-                drifted.append([name, acct, region, status, "DRIFTED", detail])
+                continue
+            # Drill into what actually drifted (assume role); fall back if the
+            # AWSControlTowerExecution role isn't there.
+            detail = _resource_drift_detail(ctx, acct, region, i.get("StackId"))
+            row = [name, acct, region, status, "DRIFTED", detail]
+            (shared_drifted if acct in shared else member_drifted).append(row)
 
-    if drifted:
+    if shared_drifted:
         report.add(Finding("stackset_drift", BLOCKER,
-                           f"{len(drifted)} AWSControlTower* StackSet instance(s) DRIFTED (out-of-band changes)",
-                           "Active drift detection found resource-level drift in CT-deployed stacks "
-                           "for accounts still enrolled in the org. Drift can cause the landing-zone "
-                           "update to fail or revert customer changes. The last column shows the "
-                           "drifted resource(s) when the role is assumable, else where to look.",
+                           f"{len(shared_drifted)} AWSControlTower* StackSet instance(s) DRIFTED in "
+                           "shared accounts (out-of-band changes)",
+                           "Active drift detection found resource-level drift in CT-deployed stacks in "
+                           "the management, log archive, or audit accounts — which the landing-zone "
+                           "update/repair/reset acts on. This can fail the update or revert changes. "
+                           "The last column shows the drifted resource(s) when the role is assumable, "
+                           "else where to look.",
                            cols=["StackSet", "Account", "Region", "Status", "Drift",
-                                 "Drifted resources / where to look"], rows=drifted,
+                                 "Drifted resources / where to look"], rows=shared_drifted,
                            remediation="Reconcile the out-of-band changes (revert them, or update the "
                                        "StackSet to match) before upgrading."))
+    if member_drifted:
+        report.add(Finding("stackset_drift_member", WARNING,
+                           f"{len(member_drifted)} AWSControlTower* StackSet instance(s) DRIFTED in "
+                           "member accounts (out-of-band changes)",
+                           "Drift in member (non-shared) accounts. A landing-zone update/repair/reset "
+                           "acts on the shared accounts first and does not touch member accounts, so "
+                           "this does NOT block the landing-zone update — but it will matter when you "
+                           "later update/re-register that account's OU. The last column shows the "
+                           "drifted resource(s) when the role is assumable, else where to look.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift",
+                                 "Drifted resources / where to look"], rows=member_drifted,
+                           remediation="Reconcile before updating or re-registering that account's OU."))
     if orphaned_drifted:
         report.add(Finding("stackset_drift_orphaned", INFO,
                            f"{len(orphaned_drifted)} DRIFTED instance(s) target accounts no longer in the org",
@@ -667,7 +699,7 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                            cols=["StackSet", "Reason", "Detail"], rows=failed[:50],
                            remediation="Re-run with a larger --drift-timeout, or check StackSet "
                                        "drift-detection permissions."))
-    if not drifted and not failed:
+    if not shared_drifted and not member_drifted and not failed:
         report.add(Finding("stackset_drift", PASS,
                            f"Active drift detection: no drift across {len(names)} "
                            "AWSControlTower StackSet(s)"))

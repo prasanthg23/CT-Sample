@@ -176,16 +176,32 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_enabled_baselines, ctx)))
 
     # 8. StackSets: INOPERABLE blocks; OUTDATED is INFO ----------------------------
-    def test_stacksets_inoperable_blocks(self):
+    def test_stacksets_inoperable_in_shared_blocks(self):
         cfn = FakeClient({
             "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-BASELINE-CONFIG"}]},
             "list_stack_instances": {"Summaries": [
-                {"Account": "1", "Region": "us-east-1", "Status": "INOPERABLE",
+                {"Account": "111111111111", "Region": "us-east-1", "Status": "INOPERABLE",
                  "DriftStatus": "NOT_CHECKED"}]},
         })
-        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        # make_ctx sets mgmt_account = 111111111111 (a shared account)
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
         ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+
+    def test_stacksets_member_drift_warns_not_blocks(self):
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-BASELINE-ROLES"}]},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "222222222222", "Region": "us-east-1", "Status": "CURRENT",
+                 "DriftStatus": "DRIFTED"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [
+            {"Id": "111111111111", "Status": "ACTIVE"},
+            {"Id": "222222222222", "Status": "ACTIVE"}]}})  # 222... is a member (not shared)
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
 
     def test_stacksets_outdated_is_info_not_blocker(self):
         cfn = FakeClient({
@@ -200,14 +216,14 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.INFO, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
-    def test_stacksets_drifted_blocks(self):
+    def test_stacksets_drifted_in_shared_blocks(self):
         cfn = FakeClient({
             "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-BASELINE-ROLES"}]},
             "list_stack_instances": {"Summaries": [
-                {"Account": "1", "Region": "us-east-1", "Status": "CURRENT",
+                {"Account": "111111111111", "Region": "us-east-1", "Status": "CURRENT",
                  "DriftStatus": "DRIFTED"}]},
         })
-        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
         ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
 
@@ -242,14 +258,34 @@ class TestBlockerPaths(unittest.TestCase):
             "detect_stack_set_drift": {"OperationId": "op-1"},
             "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
             "list_stack_instances": {"Summaries": [
-                {"Account": "1", "Region": "us-east-1", "Status": "CURRENT",
+                {"Account": "111111111111", "Region": "us-east-1", "Status": "CURRENT",
                  "DriftStatus": "DRIFTED"}]},
         })
-        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
-        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})  # 111... is mgmt (shared)
         ctx.detect_drift = True
         lv = levels(_run(ct.check_stackset_active_drift, ctx))
         self.assertIn(ct.BLOCKER, lv)
+
+    def test_active_drift_member_warns_not_blocks(self):
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "detect_stack_set_drift": {"OperationId": "op-1"},
+            "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "222222222222", "Region": "us-east-1", "Status": "CURRENT",
+                 "DriftStatus": "DRIFTED"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [
+            {"Id": "111111111111", "Status": "ACTIVE"},
+            {"Id": "222222222222", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        ctx.detect_drift = True
+        ctx.assume = lambda a, r, s: FakeClient({"describe_stack_resource_drifts":
+                                                 {"StackResourceDrifts": []}})
+        lv = levels(_run(ct.check_stackset_active_drift, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
 
     def test_active_drift_orphaned_drift_not_blocker(self):
         cfn = FakeClient({
@@ -277,10 +313,10 @@ class TestBlockerPaths(unittest.TestCase):
             "detect_stack_set_drift": {"OperationId": "op-1"},
             "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
             "list_stack_instances": {"Summaries": [
-                {"Account": "1", "Region": "us-east-1", "Status": "CURRENT", "DriftStatus": "DRIFTED",
+                {"Account": "111111111111", "Region": "us-east-1", "Status": "CURRENT", "DriftStatus": "DRIFTED",
                  "StackId": "arn:aws:cloudformation:us-east-1:1:stack/foo/abc"}]},
         })
-        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
         ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         ctx.detect_drift = True
         ctx.assume = lambda a, r, s: member
@@ -294,10 +330,10 @@ class TestBlockerPaths(unittest.TestCase):
             "detect_stack_set_drift": {"OperationId": "op-1"},
             "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
             "list_stack_instances": {"Summaries": [
-                {"Account": "1", "Region": "us-east-1", "Status": "CURRENT", "DriftStatus": "DRIFTED",
+                {"Account": "111111111111", "Region": "us-east-1", "Status": "CURRENT", "DriftStatus": "DRIFTED",
                  "StackId": "arn:aws:cloudformation:us-east-1:1:stack/foo/abc"}]},
         })
-        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
         ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         ctx.detect_drift = True
         def _boom(a, r, s):
