@@ -34,6 +34,17 @@ WHAT IT CHECKS  (each mapped to a documented LZ-update failure cause; see README
     16. SCP headroom (10-SCP-per-target limit) + customer-managed SCP inventory
     17. SCP content risk: FullAWSAccess detached, or a custom Deny that doesn't exempt
         AWSControlTowerExecution / restricts Regions via SCP (can block the update)
+    18. AWS Organizations is in ALL FEATURES mode (CT cannot run on CONSOLIDATED_BILLING)
+    19. No in-progress (RUNNING/STOPPING/QUEUED) operations on AWSControlTower* StackSets
+        (a concurrent StackSet operation conflicts with the landing-zone update)
+    20. Account Factory provisioned products are healthy (ERROR/TAINTED = failed enrollment
+        that blocks updates; UNDER_CHANGE/PLAN_IN_PROGRESS = operation mid-flight)
+
+    Severity model: only issues in the shared accounts (management, log archive, audit) and
+    org-level config hard-BLOCK the landing-zone update; the same issue in a *member* account
+    is a WARNING (the LZ update acts on shared accounts first; members re-baseline separately).
+    With --detect-drift, active CloudFormation StackSet drift detection runs and owns DRIFTED
+    reporting (the stored-status check defers to it to avoid double-counting).
 
 USAGE
 -----
@@ -505,7 +516,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                 continue
             is_bad = (status == "INOPERABLE"
                       or detailed in ("FAILED", "INOPERABLE", "CANCELLED")
-                      or drift == "DRIFTED")
+                      or (drift == "DRIFTED" and not getattr(ctx, "detect_drift", False)))
             if is_bad:
                 (shared_bad if acct in shared else member_bad).append(row)
             elif status == "OUTDATED":
@@ -941,7 +952,10 @@ def check_sts_regional_activation(ctx: Context, report: Report) -> None:
             sts.get_caller_identity()
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
-            if code in ("RegionDisabledException", "AccessDenied"):
+            # Only a genuinely disabled Region makes STS unusable there. AccessDenied
+            # (missing sts:GetCallerIdentity / an SCP) is a permissions gap, not proof
+            # the Region's STS is off — don't raise a false "STS not active" blocker.
+            if code in ("RegionDisabledException", "InvalidClientTokenId", "AuthFailure"):
                 disabled.append([region, code])
             else:
                 unknown.append(region)
@@ -1116,16 +1130,112 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                            f"found across {checked} target(s)"))
 
 
+def check_org_all_features(ctx: Context, report: Report) -> None:
+    """Control Tower requires an AWS Organizations org with ALL FEATURES enabled. A
+    CONSOLIDATED_BILLING-only org cannot run or update a landing zone."""
+    try:
+        org = ctx.orgs.describe_organization().get("Organization", {})
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("org_features", UNKNOWN, "Could not describe the organization", str(e)))
+        return
+    fs = org.get("FeatureSet")
+    if fs == "ALL":
+        report.add(Finding("org_features", PASS, "AWS Organizations is in ALL FEATURES mode"))
+    elif fs:
+        report.add(Finding("org_features", BLOCKER,
+                           f"AWS Organizations feature set is {fs}, not ALL",
+                           "Control Tower requires an organization with all features enabled; a "
+                           "CONSOLIDATED_BILLING organization cannot run or update a landing zone.",
+                           remediation="Enable all features in AWS Organizations, then retry. See "
+                                       "the AWS Organizations 'Enabling all features' docs."))
+    else:
+        report.add(Finding("org_features", UNKNOWN,
+                           "Organization feature set not returned by DescribeOrganization"))
+
+
+def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
+    """A landing-zone update cannot run concurrently with an in-progress StackSet operation
+    on the CT-managed StackSets — it conflicts and fails. Flag RUNNING/STOPPING operations."""
+    try:
+        cfn = ctx.session.client("cloudformation", region_name=ctx.region)
+        names = [s["StackSetName"] for s in
+                 _collect(cfn, "list_stack_sets", "Summaries", Status="ACTIVE")
+                 if s["StackSetName"].startswith("AWSControlTower")]
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("stackset_ops", UNKNOWN,
+                           "Could not list StackSets for in-progress operations", str(e)))
+        return
+    active = []
+    for name in names:
+        try:
+            ops = _collect(cfn, "list_stack_set_operations", "Summaries", StackSetName=name)
+        except (ClientError, BotoCoreError):
+            continue
+        for o in ops:
+            if o.get("Status") in ("RUNNING", "STOPPING", "QUEUED"):
+                active.append([name, o.get("Action", ""), o.get("Status", ""),
+                               o.get("OperationId", "")])
+    if active:
+        report.add(Finding("stackset_ops", BLOCKER,
+                           f"{len(active)} in-progress operation(s) on AWSControlTower* StackSets",
+                           "A landing-zone update cannot run while a StackSet operation on the "
+                           "CT-managed StackSets is RUNNING/STOPPING/QUEUED — it will conflict and fail.",
+                           cols=["StackSet", "Action", "Status", "OperationId"], rows=active,
+                           remediation="Wait for the in-progress StackSet operation(s) to finish "
+                                       "before upgrading."))
+    else:
+        report.add(Finding("stackset_ops", PASS,
+                           f"No in-progress operations on {len(names)} AWSControlTower StackSet(s)"))
+
+
+def check_provisioned_product_health(ctx: Context, report: Report) -> None:
+    """Account Factory provisions accounts via Service Catalog. Products in ERROR/TAINTED are
+    failed enrollments that commonly block updates; UNDER_CHANGE/PLAN_IN_PROGRESS means an
+    Account Factory operation is mid-flight."""
+    try:
+        sc = ctx.session.client("servicecatalog", region_name=ctx.region)
+        pps = _collect(sc, "search_provisioned_products", "ProvisionedProducts",
+                       AccessLevelFilter={"Key": "Account", "Value": "self"})
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("provisioned_products", UNKNOWN,
+                           "Could not search Account Factory provisioned products", str(e)))
+        return
+    bad = [p for p in pps if p.get("Status") in ("ERROR", "TAINTED")]
+    inprog = [p for p in pps if p.get("Status") in ("UNDER_CHANGE", "PLAN_IN_PROGRESS")]
+    if bad:
+        report.add(Finding("provisioned_products", BLOCKER,
+                           f"{len(bad)} Account Factory provisioned product(s) in ERROR/TAINTED",
+                           "ERROR/TAINTED Account Factory products are failed enrollments/updates "
+                           "that commonly block landing-zone updates and account re-baselining.",
+                           cols=["Product", "Status", "Type"],
+                           rows=[[p.get("Name", ""), p.get("Status", ""), p.get("Type", "")]
+                                 for p in bad],
+                           remediation="Repair or terminate the failed provisioned product(s) first."))
+    if inprog:
+        report.add(Finding("provisioned_products_inprogress", WARNING,
+                           f"{len(inprog)} provisioned product(s) UNDER_CHANGE/PLAN_IN_PROGRESS",
+                           "An Account Factory operation is in progress; let it finish before upgrading.",
+                           cols=["Product", "Status"],
+                           rows=[[p.get("Name", ""), p.get("Status", "")] for p in inprog],
+                           remediation="Wait for the Account Factory operation to complete."))
+    if not bad and not inprog:
+        report.add(Finding("provisioned_products", PASS,
+                           f"All {len(pps)} Account Factory provisioned product(s) are healthy"))
+
+
 CHECKS = [
     check_lz_status,
     check_lz_drift,
     check_update_available,
+    check_org_all_features,
     check_managed_accounts,
     check_suspended_with_provisioned_product,
+    check_provisioned_product_health,
     check_enabled_controls,
     check_enabled_baselines,
     check_stacksets,
     check_stackset_active_drift,
+    check_stackset_operations_in_progress,
     check_config_in_shared_accounts,
     check_customizations,
     check_trusted_access,

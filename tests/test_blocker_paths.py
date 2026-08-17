@@ -344,6 +344,94 @@ class TestBlockerPaths(unittest.TestCase):
         blk = [f for f in rpt.findings if f.level == ct.BLOCKER][0]
         self.assertIn("inspect stack", blk.rows[0][-1])
 
+    def test_stacksets_drift_deduped_when_detect_drift(self):
+        # With --detect-drift on, the base check must NOT also flag persisted DRIFTED
+        # (the active drift check owns drift) -> no duplicate blocker.
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "111111111111", "Region": "us-east-1", "Status": "CURRENT",
+                 "DriftStatus": "DRIFTED"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        ctx.detect_drift = True
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    # 8c. Org all-features -----------------------------------------------------------
+    def test_org_consolidated_billing_blocks(self):
+        orgs = FakeClient({"describe_organization": {"Organization": {"FeatureSet": "CONSOLIDATED_BILLING"}}})
+        ctx = make_ctx({"organizations": orgs})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_org_all_features, ctx)))
+
+    def test_org_all_features_passes(self):
+        orgs = FakeClient({"describe_organization": {"Organization": {"FeatureSet": "ALL"}}})
+        ctx = make_ctx({"organizations": orgs})
+        self.assertIn(ct.PASS, levels(_run(ct.check_org_all_features, ctx)))
+
+    # 8d. In-progress StackSet operations --------------------------------------------
+    def test_stackset_ops_in_progress_blocks(self):
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-BASELINE-CONFIG"}]},
+            "list_stack_set_operations": {"Summaries": [
+                {"Action": "UPDATE", "Status": "RUNNING", "OperationId": "op-1"}]},
+        })
+        ctx = make_ctx({"cloudformation": cfn})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_stackset_operations_in_progress, ctx)))
+
+    def test_stackset_ops_idle_passes(self):
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-BASELINE-CONFIG"}]},
+            "list_stack_set_operations": {"Summaries": [
+                {"Action": "UPDATE", "Status": "SUCCEEDED", "OperationId": "op-0"}]},
+        })
+        ctx = make_ctx({"cloudformation": cfn})
+        lv = levels(_run(ct.check_stackset_operations_in_progress, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    # 8e. Account Factory provisioned-product health ---------------------------------
+    def test_provisioned_product_tainted_blocks(self):
+        sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
+            {"Name": "acct-x", "Status": "TAINTED", "Type": "CONTROL_TOWER_ACCOUNT"}]}})
+        ctx = make_ctx({"servicecatalog": sc})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_provisioned_product_health, ctx)))
+
+    def test_provisioned_product_under_change_warns(self):
+        sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
+            {"Name": "acct-y", "Status": "UNDER_CHANGE", "Type": "CONTROL_TOWER_ACCOUNT"}]}})
+        ctx = make_ctx({"servicecatalog": sc})
+        lv = levels(_run(ct.check_provisioned_product_health, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_provisioned_product_available_passes(self):
+        sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
+            {"Name": "acct-z", "Status": "AVAILABLE", "Type": "CONTROL_TOWER_ACCOUNT"}]}})
+        ctx = make_ctx({"servicecatalog": sc})
+        self.assertIn(ct.PASS, levels(_run(ct.check_provisioned_product_health, ctx)))
+
+    # 8f. STS AccessDenied must not be a false "region disabled" blocker -------------
+    def test_sts_access_denied_is_unknown_not_blocker(self):
+        ctx = make_ctx()
+        ctx.governed_regions = ["us-east-1"]
+        with mock.patch.object(
+                ct.boto3, "client",
+                return_value=FakeClient(errors={"get_caller_identity": client_error("AccessDenied")})):
+            lv = levels(_run(ct.check_sts_regional_activation, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_sts_region_disabled_blocks(self):
+        ctx = make_ctx()
+        ctx.governed_regions = ["ap-east-1"]
+        with mock.patch.object(
+                ct.boto3, "client",
+                return_value=FakeClient(errors={"get_caller_identity": client_error("RegionDisabledException")})):
+            lv = levels(_run(ct.check_sts_regional_activation, ctx))
+        self.assertIn(ct.BLOCKER, lv)
+
     # 9. Config in shared accounts: extra recorder warns; unreachable = UNKNOWN ----
     def test_config_extra_recorder_warns(self):
         ctx = make_ctx()
