@@ -432,6 +432,58 @@ class TestBlockerPaths(unittest.TestCase):
             lv = levels(_run(ct.check_sts_regional_activation, ctx))
         self.assertIn(ct.BLOCKER, lv)
 
+    # 8g. Opt-in: member execution-role sweep ---------------------------------------
+    def test_member_roles_skipped_when_disabled(self):
+        ctx = make_ctx()
+        lv = levels(_run(ct.check_member_execution_roles, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_member_roles_all_assumable_passes(self):
+        orgs = FakeClient({"list_accounts": {"Accounts": [
+            {"Id": "111111111111", "Status": "ACTIVE"},   # mgmt (skipped)
+            {"Id": "222222222222", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"organizations": orgs})
+        ctx.check_member_roles = True
+        ctx.assume = lambda a, r, s: FakeClient()  # get_caller_identity -> {}
+        self.assertIn(ct.PASS, levels(_run(ct.check_member_execution_roles, ctx)))
+
+    def test_member_roles_not_assumable_warns(self):
+        orgs = FakeClient({"list_accounts": {"Accounts": [
+            {"Id": "111111111111", "Status": "ACTIVE"},
+            {"Id": "222222222222", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"organizations": orgs})
+        ctx.check_member_roles = True
+        def _boom(a, r, s):
+            raise client_error("AccessDenied", "AssumeRole")
+        ctx.assume = _boom
+        lv = levels(_run(ct.check_member_execution_roles, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    # 8h. Opt-in: KMS key policy -----------------------------------------------------
+    def test_kms_policy_skipped_when_disabled(self):
+        ctx = make_ctx()
+        ctx.kms_key_arn = "arn:aws:kms:us-east-1:1:key/abc"
+        lv = levels(_run(ct.check_kms_key_policy, ctx))
+        self.assertIn(ct.INFO, lv)
+
+    def test_kms_policy_missing_principals_warns(self):
+        kms = FakeClient({"get_key_policy": {"Policy": '{"Statement":[{"Principal":{"AWS":"x"}}]}'}})
+        ctx = make_ctx({"kms": kms})
+        ctx.kms_key_arn = "arn:aws:kms:us-east-1:1:key/abc"
+        ctx.check_kms_policy = True
+        lv = levels(_run(ct.check_kms_key_policy, ctx))
+        self.assertIn(ct.WARNING, lv)
+
+    def test_kms_policy_ok_passes(self):
+        pol = '{"Statement":[{"Principal":{"Service":["config.amazonaws.com","cloudtrail.amazonaws.com"]}}]}'
+        kms = FakeClient({"get_key_policy": {"Policy": pol}})
+        ctx = make_ctx({"kms": kms})
+        ctx.kms_key_arn = "arn:aws:kms:us-east-1:1:key/abc"
+        ctx.check_kms_policy = True
+        self.assertIn(ct.PASS, levels(_run(ct.check_kms_key_policy, ctx)))
+
     # 9. Config in shared accounts: extra recorder warns; unreachable = UNKNOWN ----
     def test_config_extra_recorder_warns(self):
         ctx = make_ctx()

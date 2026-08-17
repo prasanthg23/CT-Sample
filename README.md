@@ -71,7 +71,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 5 | Orphaned provisioned products | Suspended account still holding an Account Factory product (→ `AWSControlTowerExecution` can't be assumed) | `organizations:ListAccounts` + `servicecatalog:SearchProvisionedProducts` | BLOCKER |
 | 6 | Enabled controls drift | Drifted / non-`SUCCEEDED` controls across every registered OU | `organizations` (OU discovery) + `controltower:ListEnabledControls` | BLOCKER |
 | 7 | Enabled baselines drift | Drifted / non-`SUCCEEDED` baselines incl. child accounts | `controltower:ListEnabledBaselines` (`includeChildren=true`) | BLOCKER |
-| 8 | StackSet health | `AWSControlTower*` stack instances INOPERABLE/FAILED/DRIFTED (OUTDATED is reported as INFO — it is normal before an update) | `cloudformation:ListStackSets` / `ListStackInstances` | BLOCKER / INFO |
+| 8 | StackSet health | `AWSControlTower*` stack instances INOPERABLE/FAILED/DRIFTED. Only **shared-account** (mgmt/audit/log-archive) instances block; **member-account** instances are WARNING; instances for **departed accounts** are INFO. OUTDATED is INFO (normal before an update). | `cloudformation:ListStackSets` / `ListStackInstances` | BLOCKER / WARNING / INFO |
 | 9 | AWS Config in shared accounts | Extra/foreign Config recorders in Audit & Log Archive (and non-home Regions) | `sts:AssumeRole` + `config:DescribeConfigurationRecorders` | WARNING |
 | 10 | Customizations | CfCT / AFT / custom StackSets targeting governed Regions | `cloudformation` / `organizations` | INFO |
 | 11 | Trusted access | Required Organizations trusted service access disabled | `organizations:ListAWSServiceAccessForOrganization` | BLOCKER |
@@ -81,6 +81,24 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 15 | STS regional activation | STS deactivated in a governed Region (update fails midway) | `sts:GetCallerIdentity` (per Region) | BLOCKER |
 | 16 | SCP headroom | Target at/near the 10-SCP limit + custom SCP inventory | `organizations:ListPoliciesForTarget` | WARNING |
 | 17 | SCP blocking content | `FullAWSAccess` detached; custom Deny not exempting `AWSControlTowerExecution`; Region restriction via SCP | `organizations:ListPoliciesForTarget` / `DescribePolicy` | WARNING |
+| 18 | Organizations all-features | Org in `CONSOLIDATED_BILLING` instead of `ALL` (CT cannot run/upgrade) | `organizations:DescribeOrganization` | BLOCKER |
+| 19 | In-progress StackSet operations | `RUNNING`/`STOPPING`/`QUEUED` operation on an `AWSControlTower*` StackSet (conflicts with the update) | `cloudformation:ListStackSetOperations` | BLOCKER |
+| 20 | Account Factory product health | Provisioned products in `ERROR`/`TAINTED` (failed enrollment) or `UNDER_CHANGE`/`PLAN_IN_PROGRESS` (mid-flight) | `servicecatalog:SearchProvisionedProducts` | BLOCKER / WARNING |
+
+**Opt-in deeper checks** (off by default — slower or heuristic; enable with a flag):
+
+| Flag | Check | Detects | Data source | Default severity |
+|------|-------|---------|-------------|------------------|
+| `--detect-drift` | Active StackSet drift | Actually runs CloudFormation drift detection on `AWSControlTower*` StackSets and reports **DRIFTED** instances with the drifted resource(s); without it, stored `DriftStatus` is only as fresh as the last run (often `NOT_CHECKED`) | `cloudformation:DetectStackSetDrift` / `DescribeStackSetOperation` / `DescribeStackResourceDrifts` | BLOCKER (shared) / WARNING (member) |
+| `--check-member-roles` | Member execution-role sweep | Assumes into every enrolled account to confirm `AWSControlTowerExecution` exists/assumable (missing = role drift → LZ can become unavailable) | `sts:AssumeRole` per account | WARNING |
+| `--check-kms-policy` | KMS key-policy | Landing-zone CMK key policy does not grant CT's `config`/`cloudtrail` service principals (heuristic) | `kms:GetKeyPolicy` | WARNING |
+
+> **Severity model.** Only issues in the **shared accounts** (management, log archive, audit) and
+> org-level configuration **hard-block** the landing-zone update. The same issue in a **member**
+> account is a **WARNING**, because a landing-zone update/repair/reset acts on the shared accounts
+> and org config first — member accounts are re-baselined separately (via *Re-register OU*). With
+> `--detect-drift`, active drift detection owns `DRIFTED` reporting and the stored-status check
+> defers to it (no double-counting).
 
 The required CT management-account IAM roles verified by check #13 are:
 `AWSControlTowerAdmin`, `AWSControlTowerCloudTrailRole`, `AWSControlTowerStackSetRole`,
@@ -117,8 +135,13 @@ The required CT management-account IAM roles verified by check #13 are:
         "cloudformation:DescribeStackSet",
         "cloudformation:ListStackInstances",
         "cloudformation:ListStacks",
+        "cloudformation:ListStackSetOperations",
+        "cloudformation:DetectStackSetDrift",
+        "cloudformation:DescribeStackSetOperation",
+        "cloudformation:DescribeStackResourceDrifts",
         "iam:GetRole",
         "kms:DescribeKey",
+        "kms:GetKeyPolicy",
         "sts:GetCallerIdentity",
         "sts:AssumeRole"
       ],
@@ -155,6 +178,11 @@ python3 Source/ct_preupgrade_precheck.py --json report.json --strict
 # Override shared account discovery if the manifest lookup is unavailable:
 python3 Source/ct_preupgrade_precheck.py \
     --audit-account 111111111111 --log-archive-account 222222222222
+
+# Opt-in deeper checks (slower / heuristic; off by default):
+python3 Source/ct_preupgrade_precheck.py --detect-drift            # active StackSet drift detection
+python3 Source/ct_preupgrade_precheck.py --check-member-roles      # assume into every enrolled account
+python3 Source/ct_preupgrade_precheck.py --check-kms-policy        # verify CMK key policy grants CT services
 ```
 
 ### Exit codes (for pipeline gating)
@@ -219,7 +247,7 @@ severity fires (e.g. DRIFTED → BLOCKER, OUTDATED StackSet → INFO, unreachabl
 UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
 
 ```bash
-python3 tests/test_blocker_paths.py      # 29 tests, plain unittest (no extra deps)
+python3 tests/test_blocker_paths.py      # 52 tests, plain unittest (no extra deps)
 ```
 
 This complements a live run against a healthy landing zone (which only exercises the PASS/INFO

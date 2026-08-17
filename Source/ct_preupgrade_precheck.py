@@ -180,6 +180,8 @@ class Context:
         self.kms_key_arn: Optional[str] = None
         self.detect_drift: bool = False
         self.drift_timeout: int = 900
+        self.check_member_roles: bool = False
+        self.check_kms_policy: bool = False
 
     def discover(self, report: Report) -> bool:
         try:
@@ -1223,6 +1225,83 @@ def check_provisioned_product_health(ctx: Context, report: Report) -> None:
                            f"All {len(pps)} Account Factory provisioned product(s) are healthy"))
 
 
+def check_member_execution_roles(ctx: Context, report: Report) -> None:
+    """OPT-IN (--check-member-roles): the AWSControlTowerExecution role must exist and be
+    assumable in every enrolled account. A missing/modified role is 'role drift' that can make
+    the landing zone unavailable. This assumes into each account (slower), so it is opt-in."""
+    if not getattr(ctx, "check_member_roles", False):
+        report.add(Finding("member_roles", INFO,
+                           "Member-account execution-role sweep skipped (opt-in)",
+                           "The AWSControlTowerExecution role must exist in every enrolled "
+                           "account; a missing/unassumable role is 'role drift' that can make "
+                           "the landing zone unavailable.",
+                           remediation="Re-run with --check-member-roles to verify (slower; "
+                                       "assumes into each account)."))
+        return
+    try:
+        accounts = _collect(ctx.orgs, "list_accounts", "Accounts")
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("member_roles", UNKNOWN, "Could not list accounts", str(e)))
+        return
+    not_assumable, checked = [], 0
+    for a in accounts:
+        acct = a.get("Id")
+        # The management account does not host the execution role; skip it and non-active accounts.
+        if acct == ctx.mgmt_account or a.get("Status") != "ACTIVE":
+            continue
+        checked += 1
+        try:
+            ctx.assume(acct, ctx.region, "sts").get_caller_identity()
+        except Exception as e:  # AssumeRole denied / role missing / any error
+            not_assumable.append([acct, a.get("Name", ""), type(e).__name__])
+    if not_assumable:
+        report.add(Finding("member_roles", WARNING,
+                           f"{len(not_assumable)} enrolled account(s): {ctx.member_role} not assumable",
+                           "Could not assume the execution role in these accounts. This may be role "
+                           "drift (missing/modified AWSControlTowerExecution — which can make the LZ "
+                           "unavailable) or an SCP/permission boundary. Verify before upgrading.",
+                           cols=["Account", "Name", "Error"], rows=not_assumable,
+                           remediation="Confirm the AWSControlTowerExecution role exists and is "
+                                       "assumable; if it is role drift, repair via Reset/Re-register."))
+    else:
+        report.add(Finding("member_roles", PASS,
+                           f"{ctx.member_role} assumable in all {checked} enrolled member account(s)"))
+
+
+def check_kms_key_policy(ctx: Context, report: Report) -> None:
+    """OPT-IN (--check-kms-policy): if the landing zone uses a customer-managed KMS key, its key
+    policy must allow Control Tower's Config and CloudTrail integration to use the key, or the
+    update can fail with a KMS error. Heuristic string check (key policies vary), so opt-in."""
+    if not ctx.kms_key_arn:
+        return  # no CMK -> the enabled-state check already reported INFO
+    if not getattr(ctx, "check_kms_policy", False):
+        report.add(Finding("kms_policy", INFO,
+                           "KMS key-policy check skipped (opt-in)",
+                           "A customer-managed KMS key is configured; its policy must allow CT's "
+                           "Config/CloudTrail integration.",
+                           remediation="Re-run with --check-kms-policy to heuristically verify it."))
+        return
+    try:
+        kms = ctx.session.client("kms", region_name=ctx.region)
+        pol = kms.get_key_policy(KeyId=ctx.kms_key_arn, PolicyName="default").get("Policy", "")
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("kms_policy", UNKNOWN, "Could not read the KMS key policy", str(e)))
+        return
+    missing = [s for s in ("config.amazonaws.com", "cloudtrail.amazonaws.com") if s not in pol]
+    if missing:
+        report.add(Finding("kms_policy", WARNING,
+                           "Landing zone KMS key policy may not grant required CT services",
+                           "The key policy does not reference: " + ", ".join(missing) + ". "
+                           "Control Tower's Config/CloudTrail integration must be allowed to use "
+                           "the key or the update can fail with a KMS error. (Heuristic check — "
+                           "confirm the policy, e.g. access may be granted via grants/conditions.)",
+                           remediation="Ensure the key policy allows config.amazonaws.com and "
+                                       "cloudtrail.amazonaws.com to use the key."))
+    else:
+        report.add(Finding("kms_policy", PASS,
+                           "KMS key policy references Config and CloudTrail service principals"))
+
+
 CHECKS = [
     check_lz_status,
     check_lz_drift,
@@ -1241,7 +1320,9 @@ CHECKS = [
     check_trusted_access,
     check_delegated_admins,
     check_required_iam_roles,
+    check_member_execution_roles,
     check_kms_key,
+    check_kms_key_policy,
     check_sts_regional_activation,
     check_scp_headroom,
     check_scp_blocking,
@@ -1308,6 +1389,12 @@ def main() -> int:
                          "AWSControlTower* StackSets (slower; launches drift operations)")
     ap.add_argument("--drift-timeout", type=int, default=900,
                     help="Max seconds to wait for each StackSet drift operation (default 900)")
+    ap.add_argument("--check-member-roles", action="store_true",
+                    help="Assume into every enrolled account to verify the execution role "
+                         "(AWSControlTowerExecution) is present/assumable (slower)")
+    ap.add_argument("--check-kms-policy", action="store_true",
+                    help="Heuristically verify the landing-zone CMK key policy grants CT's "
+                         "Config/CloudTrail service principals")
     ap.add_argument("--strict", action="store_true",
                     help="Treat WARNING and UNKNOWN as blocking too")
     args = ap.parse_args()
@@ -1329,6 +1416,8 @@ def main() -> int:
         ctx.log_archive_account = args.log_archive_account
     ctx.detect_drift = args.detect_drift
     ctx.drift_timeout = args.drift_timeout
+    ctx.check_member_roles = args.check_member_roles
+    ctx.check_kms_policy = args.check_kms_policy
 
     for check in CHECKS:
         try:
