@@ -34,10 +34,9 @@ WHAT IT CHECKS  (each mapped to a documented LZ-update failure cause; see README
     16. SCP headroom (10-SCP-per-target limit) + customer-managed SCP inventory
     17. SCP content risk: FullAWSAccess detached, or a custom Deny that doesn't exempt
         AWSControlTowerExecution / restricts Regions via SCP (can block the update)
-    18. AWS Organizations is in ALL FEATURES mode (CT cannot run on CONSOLIDATED_BILLING)
-    19. No in-progress (RUNNING/STOPPING/QUEUED) operations on AWSControlTower* StackSets
+    18. No in-progress (RUNNING/STOPPING/QUEUED) operations on AWSControlTower* StackSets
         (a concurrent StackSet operation conflicts with the landing-zone update)
-    20. Account Factory provisioned products are healthy (ERROR/TAINTED = failed enrollment
+    19. Account Factory provisioned products are healthy (ERROR/TAINTED = failed enrollment
         that blocks updates; UNDER_CHANGE/PLAN_IN_PROGRESS = operation mid-flight)
 
     Severity model: only issues in the shared accounts (management, log archive, audit) and
@@ -68,7 +67,7 @@ EXIT CODES
 
 REQUIRED PERMISSIONS (management account, read-only)
     controltower:ListLandingZones, GetLandingZone, ListEnabledControls, ListEnabledBaselines
-    organizations:DescribeOrganization, ListRoots, ListOrganizationalUnitsForParent,
+    organizations:ListRoots, ListOrganizationalUnitsForParent,
                   ListAccounts, ListPolicies, ListPoliciesForTarget,
                   ListAWSServiceAccessForOrganization, ListDelegatedAdministrators,
                   ListDelegatedServicesForAccount, DescribePolicy
@@ -1132,29 +1131,6 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                            f"found across {checked} target(s)"))
 
 
-def check_org_all_features(ctx: Context, report: Report) -> None:
-    """Control Tower requires an AWS Organizations org with ALL FEATURES enabled. A
-    CONSOLIDATED_BILLING-only org cannot run or update a landing zone."""
-    try:
-        org = ctx.orgs.describe_organization().get("Organization", {})
-    except (ClientError, BotoCoreError) as e:
-        report.add(Finding("org_features", UNKNOWN, "Could not describe the organization", str(e)))
-        return
-    fs = org.get("FeatureSet")
-    if fs == "ALL":
-        report.add(Finding("org_features", PASS, "AWS Organizations is in ALL FEATURES mode"))
-    elif fs:
-        report.add(Finding("org_features", BLOCKER,
-                           f"AWS Organizations feature set is {fs}, not ALL",
-                           "Control Tower requires an organization with all features enabled; a "
-                           "CONSOLIDATED_BILLING organization cannot run or update a landing zone.",
-                           remediation="Enable all features in AWS Organizations, then retry. See "
-                                       "the AWS Organizations 'Enabling all features' docs."))
-    else:
-        report.add(Finding("org_features", UNKNOWN,
-                           "Organization feature set not returned by DescribeOrganization"))
-
-
 def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
     """A landing-zone update cannot run concurrently with an in-progress StackSet operation
     on the CT-managed StackSets — it conflicts and fails. Flag RUNNING/STOPPING operations."""
@@ -1306,7 +1282,6 @@ CHECKS = [
     check_lz_status,
     check_lz_drift,
     check_update_available,
-    check_org_all_features,
     check_managed_accounts,
     check_suspended_with_provisioned_product,
     check_provisioned_product_health,

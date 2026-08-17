@@ -359,17 +359,6 @@ class TestBlockerPaths(unittest.TestCase):
         lv = levels(_run(ct.check_stacksets, ctx))
         self.assertNotIn(ct.BLOCKER, lv)
 
-    # 8c. Org all-features -----------------------------------------------------------
-    def test_org_consolidated_billing_blocks(self):
-        orgs = FakeClient({"describe_organization": {"Organization": {"FeatureSet": "CONSOLIDATED_BILLING"}}})
-        ctx = make_ctx({"organizations": orgs})
-        self.assertIn(ct.BLOCKER, levels(_run(ct.check_org_all_features, ctx)))
-
-    def test_org_all_features_passes(self):
-        orgs = FakeClient({"describe_organization": {"Organization": {"FeatureSet": "ALL"}}})
-        ctx = make_ctx({"organizations": orgs})
-        self.assertIn(ct.PASS, levels(_run(ct.check_org_all_features, ctx)))
-
     # 8d. In-progress StackSet operations --------------------------------------------
     def test_stackset_ops_in_progress_blocks(self):
         cfn = FakeClient({
