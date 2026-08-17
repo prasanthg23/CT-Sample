@@ -167,6 +167,8 @@ class Context:
         self.audit_account: Optional[str] = None
         self.mgmt_account: Optional[str] = None
         self.kms_key_arn: Optional[str] = None
+        self.detect_drift: bool = False
+        self.drift_timeout: int = 900
 
     def discover(self, report: Report) -> bool:
         try:
@@ -468,7 +470,15 @@ def check_stacksets(ctx: Context, report: Report) -> None:
         report.add(Finding("stacksets", UNKNOWN,
                            "Could not list CloudFormation StackSets", str(e)))
         return
-    bad, outdated = [], []
+    # Current org accounts — instances for accounts no longer in the org are
+    # orphaned StackSet leftovers (StackSets don't auto-delete on account removal)
+    # and are NOT acted on by a landing-zone update, so they must not block it.
+    try:
+        org_ids = {a["Id"] for a in _collect(ctx.orgs, "list_accounts", "Accounts")}
+    except (ClientError, BotoCoreError):
+        org_ids = None  # couldn't verify membership; don't suppress anything
+
+    bad, outdated, orphaned = [], [], []
     for name in names:
         try:
             insts = _collect(cfn, "list_stack_instances", "Summaries", StackSetName=name)
@@ -478,8 +488,17 @@ def check_stacksets(ctx: Context, report: Report) -> None:
             status = i.get("Status")  # summary status: CURRENT | OUTDATED | INOPERABLE
             detailed = (i.get("StackInstanceStatus") or {}).get("DetailedStatus")
             drift = i.get("DriftStatus")
-            row = [name, i.get("Account", ""), i.get("Region", ""),
-                   str(status or detailed), str(drift)]
+            acct = i.get("Account", "")
+            # Show summary + detailed when they differ (e.g. OUTDATED/FAILED) so the
+            # real signal isn't hidden behind the summary status.
+            status_disp = str(status or detailed)
+            if detailed and detailed != status:
+                status_disp = f"{status}/{detailed}"
+            row = [name, acct, i.get("Region", ""), status_disp, str(drift)]
+            # Orphaned: target account has left the org -> stale leftover, not a blocker.
+            if org_ids is not None and acct and acct not in org_ids:
+                orphaned.append(row)
+                continue
             # Real blockers: an instance that can't be updated, failed, or has drifted.
             if status == "INOPERABLE" or detailed in ("FAILED", "INOPERABLE", "CANCELLED"):
                 bad.append(row)
@@ -491,23 +510,134 @@ def check_stacksets(ctx: Context, report: Report) -> None:
     if bad:
         report.add(Finding("stacksets", BLOCKER,
                            f"{len(bad)} AWSControlTower* StackSet instance(s) inoperable/failed/drifted",
-                           "INOPERABLE/FAILED or DRIFTED stack instances cause the landing-zone "
-                           "update to fail. (OUTDATED instances are not counted here — that state "
-                           "is normal before an update.)",
+                           "INOPERABLE/FAILED or DRIFTED stack instances in accounts still enrolled in "
+                           "the org cause the landing-zone update to fail. (OUTDATED instances, and "
+                           "instances for accounts no longer in the org, are not counted here.)",
                            cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=bad,
                            remediation="Repair or remove (Retain Stacks) the affected instances "
                                        "before upgrading."))
-    elif outdated:
-        report.add(Finding("stacksets", INFO,
-                           f"{len(outdated)} StackSet instance(s) are OUTDATED (expected)",
-                           "OUTDATED means the instances are behind the current template — this is "
-                           "normal when a landing-zone update is pending, and the update will "
-                           "refresh them. No inoperable/failed/drifted instances were found.",
+    if orphaned:
+        report.add(Finding("stacksets_orphaned", INFO,
+                           f"{len(orphaned)} stale StackSet instance(s) target accounts no longer in the org",
+                           "These instances belong to account(s) that have left the organization. "
+                           "Control Tower does not act on them during a landing-zone update, so they "
+                           "do NOT block it — but they are safe to clean up.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=orphaned[:50],
+                           remediation="Optionally delete these stale instances "
+                                       "(DeleteStackInstances with RetainStacks) to tidy up."))
+    if not bad:
+        if outdated:
+            report.add(Finding("stacksets", INFO,
+                               f"{len(outdated)} StackSet instance(s) are OUTDATED (expected)",
+                               "OUTDATED means the instances are behind the current template — this is "
+                               "normal when a landing-zone update is pending, and the update will "
+                               "refresh them. No inoperable/failed/drifted instances were found.",
+                               cols=["StackSet", "Account", "Region", "Status", "Drift"],
+                               rows=outdated[:50]))
+        elif not orphaned:
+            report.add(Finding("stacksets", PASS,
+                               f"All instances CURRENT across {len(names)} AWSControlTower StackSet(s)"))
+
+
+def check_stackset_active_drift(ctx: Context, report: Report) -> None:
+    """OPT-IN (--detect-drift): actively run CloudFormation StackSet drift detection on
+    the AWSControlTower* StackSets to catch out-of-band changes to CT-deployed stack
+    resources. The default (off) only reads stored DriftStatus, which stays NOT_CHECKED
+    until a detection has actually been run — so out-of-band stack edits are otherwise
+    invisible. This launches StackSet drift operations and can take several minutes."""
+    if not getattr(ctx, "detect_drift", False):
+        report.add(Finding("stackset_drift", INFO,
+                           "Active StackSet drift detection skipped (opt-in)",
+                           "The StackSet DriftStatus reported above is only as fresh as the last "
+                           "drift-detection run (frequently NOT_CHECKED). Out-of-band edits to "
+                           "resources inside CT-deployed stacks are NOT detected without this.",
+                           remediation="Re-run with --detect-drift to actively detect drift "
+                                       "(slower; launches StackSet drift operations)."))
+        return
+
+    import time
+    try:
+        cfn = ctx.session.client("cloudformation", region_name=ctx.region)
+        names = [s["StackSetName"] for s in
+                 _collect(cfn, "list_stack_sets", "Summaries", Status="ACTIVE")
+                 if s["StackSetName"].startswith("AWSControlTower")]
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("stackset_drift", UNKNOWN,
+                           "Could not list StackSets for drift detection", str(e)))
+        return
+    try:
+        org_ids = {a["Id"] for a in _collect(ctx.orgs, "list_accounts", "Accounts")}
+    except (ClientError, BotoCoreError):
+        org_ids = None
+
+    deadline = time.time() + getattr(ctx, "drift_timeout", 900)
+    failed = []
+    for name in names:
+        try:
+            op = cfn.detect_stack_set_drift(StackSetName=name)["OperationId"]
+        except (ClientError, BotoCoreError) as e:
+            failed.append([name, "detect_start_failed", str(e)[:80]])
+            continue
+        while True:
+            try:
+                st = cfn.describe_stack_set_operation(
+                    StackSetName=name, OperationId=op)["StackSetOperation"]["Status"]
+            except (ClientError, BotoCoreError) as e:
+                failed.append([name, "poll_failed", str(e)[:80]])
+                break
+            if st in ("SUCCEEDED", "FAILED", "STOPPED"):
+                if st != "SUCCEEDED":
+                    failed.append([name, f"operation_{st}", ""])
+                break
+            if time.time() > deadline:
+                failed.append([name, "timeout", ""])
+                break
+            time.sleep(10)
+
+    drifted, orphaned_drifted = [], []
+    for name in names:
+        try:
+            insts = _collect(cfn, "list_stack_instances", "Summaries", StackSetName=name)
+        except (ClientError, BotoCoreError):
+            continue
+        for i in insts:
+            if i.get("DriftStatus") != "DRIFTED":
+                continue
+            acct = i.get("Account", "")
+            row = [name, acct, i.get("Region", ""),
+                   str(i.get("Status") or (i.get("StackInstanceStatus") or {}).get("DetailedStatus")),
+                   str(i.get("DriftStatus"))]
+            if org_ids is not None and acct and acct not in org_ids:
+                orphaned_drifted.append(row)
+            else:
+                drifted.append(row)
+
+    if drifted:
+        report.add(Finding("stackset_drift", BLOCKER,
+                           f"{len(drifted)} AWSControlTower* StackSet instance(s) DRIFTED (out-of-band changes)",
+                           "Active drift detection found resource-level drift in CT-deployed stacks "
+                           "for accounts still enrolled in the org. Drift can cause the landing-zone "
+                           "update to fail or revert customer changes.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=drifted,
+                           remediation="Reconcile the out-of-band changes (revert them, or update the "
+                                       "StackSet to match) before upgrading."))
+    if orphaned_drifted:
+        report.add(Finding("stackset_drift_orphaned", INFO,
+                           f"{len(orphaned_drifted)} DRIFTED instance(s) target accounts no longer in the org",
+                           "Drifted, but for departed accounts — stale leftovers, not a blocker.",
                            cols=["StackSet", "Account", "Region", "Status", "Drift"],
-                           rows=outdated[:50]))
-    else:
-        report.add(Finding("stacksets", PASS,
-                           f"All instances CURRENT across {len(names)} AWSControlTower StackSet(s)"))
+                           rows=orphaned_drifted[:50]))
+    if failed:
+        report.add(Finding("stackset_drift", UNKNOWN,
+                           f"Drift detection did not complete for {len(failed)} StackSet(s)",
+                           "Their drift state is unverified (detection failed or timed out).",
+                           cols=["StackSet", "Reason", "Detail"], rows=failed[:50],
+                           remediation="Re-run with a larger --drift-timeout, or check StackSet "
+                                       "drift-detection permissions."))
+    if not drifted and not failed:
+        report.add(Finding("stackset_drift", PASS,
+                           f"Active drift detection: no drift across {len(names)} "
+                           "AWSControlTower StackSet(s)"))
 
 
 def check_config_in_shared_accounts(ctx: Context, report: Report) -> None:
@@ -930,6 +1060,7 @@ CHECKS = [
     check_enabled_controls,
     check_enabled_baselines,
     check_stacksets,
+    check_stackset_active_drift,
     check_config_in_shared_accounts,
     check_customizations,
     check_trusted_access,
@@ -997,6 +1128,11 @@ def main() -> int:
     ap.add_argument("--audit-account", help="Override Audit account id")
     ap.add_argument("--log-archive-account", help="Override Log Archive account id")
     ap.add_argument("--json", help="Write full JSON report to this path")
+    ap.add_argument("--detect-drift", action="store_true",
+                    help="Actively run CloudFormation StackSet drift detection on "
+                         "AWSControlTower* StackSets (slower; launches drift operations)")
+    ap.add_argument("--drift-timeout", type=int, default=900,
+                    help="Max seconds to wait for each StackSet drift operation (default 900)")
     ap.add_argument("--strict", action="store_true",
                     help="Treat WARNING and UNKNOWN as blocking too")
     args = ap.parse_args()
@@ -1016,6 +1152,8 @@ def main() -> int:
         ctx.audit_account = args.audit_account
     if args.log_archive_account:
         ctx.log_archive_account = args.log_archive_account
+    ctx.detect_drift = args.detect_drift
+    ctx.drift_timeout = args.drift_timeout
 
     for check in CHECKS:
         try:

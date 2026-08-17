@@ -183,7 +183,8 @@ class TestBlockerPaths(unittest.TestCase):
                 {"Account": "1", "Region": "us-east-1", "Status": "INOPERABLE",
                  "DriftStatus": "NOT_CHECKED"}]},
         })
-        ctx = make_ctx({"cloudformation": cfn})
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
 
     def test_stacksets_outdated_is_info_not_blocker(self):
@@ -193,7 +194,8 @@ class TestBlockerPaths(unittest.TestCase):
                 {"Account": "1", "Region": "us-east-1", "Status": "OUTDATED",
                  "DriftStatus": "NOT_CHECKED"}]},
         })
-        ctx = make_ctx({"cloudformation": cfn})
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         lv = levels(_run(ct.check_stacksets, ctx))
         self.assertIn(ct.INFO, lv)
         self.assertNotIn(ct.BLOCKER, lv)
@@ -205,8 +207,65 @@ class TestBlockerPaths(unittest.TestCase):
                 {"Account": "1", "Region": "us-east-1", "Status": "CURRENT",
                  "DriftStatus": "DRIFTED"}]},
         })
-        ctx = make_ctx({"cloudformation": cfn})
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+
+    def test_stacksets_orphaned_account_not_blocker(self):
+        # A FAILED/INOPERABLE instance for an account that has LEFT the org is a
+        # stale StackSet leftover: it must be INFO (cleanup), never a BLOCKER,
+        # because a landing-zone update does not act on departed accounts.
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "999999999999", "Region": "us-east-1", "Status": "OUTDATED",
+                 "StackInstanceStatus": {"DetailedStatus": "FAILED"},
+                 "DriftStatus": "NOT_CHECKED"}]},
+        })
+        # Org does NOT contain 999999999999.
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    # 8b. Active StackSet drift detection (opt-in --detect-drift) ------------------
+    def test_active_drift_skipped_when_disabled(self):
+        ctx = make_ctx()  # detect_drift defaults False
+        lv = levels(_run(ct.check_stackset_active_drift, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_active_drift_detects_drift_blocks(self):
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "detect_stack_set_drift": {"OperationId": "op-1"},
+            "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "1", "Region": "us-east-1", "Status": "CURRENT",
+                 "DriftStatus": "DRIFTED"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        ctx.detect_drift = True
+        lv = levels(_run(ct.check_stackset_active_drift, ctx))
+        self.assertIn(ct.BLOCKER, lv)
+
+    def test_active_drift_orphaned_drift_not_blocker(self):
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "detect_stack_set_drift": {"OperationId": "op-1"},
+            "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "999999999999", "Region": "us-east-1", "Status": "CURRENT",
+                 "DriftStatus": "DRIFTED"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        ctx.detect_drift = True
+        lv = levels(_run(ct.check_stackset_active_drift, ctx))
+        self.assertNotIn(ct.BLOCKER, lv)
+        self.assertIn(ct.INFO, lv)
 
     # 9. Config in shared accounts: extra recorder warns; unreachable = UNKNOWN ----
     def test_config_extra_recorder_warns(self):
