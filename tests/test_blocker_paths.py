@@ -267,6 +267,47 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertNotIn(ct.BLOCKER, lv)
         self.assertIn(ct.INFO, lv)
 
+    def test_active_drift_reports_resource_detail(self):
+        member = FakeClient({"describe_stack_resource_drifts": {"StackResourceDrifts": [
+            {"LogicalResourceId": "AWSControlTowerExecutionRole", "ResourceType": "AWS::IAM::Role",
+             "StackResourceDriftStatus": "MODIFIED",
+             "PropertyDifferences": [{"PropertyPath": "/AssumeRolePolicyDocument"}]}]}})
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "detect_stack_set_drift": {"OperationId": "op-1"},
+            "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "1", "Region": "us-east-1", "Status": "CURRENT", "DriftStatus": "DRIFTED",
+                 "StackId": "arn:aws:cloudformation:us-east-1:1:stack/foo/abc"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        ctx.detect_drift = True
+        ctx.assume = lambda a, r, s: member
+        rpt = _run(ct.check_stackset_active_drift, ctx)
+        blk = [f for f in rpt.findings if f.level == ct.BLOCKER][0]
+        self.assertIn("AWS::IAM::Role/AWSControlTowerExecutionRole:MODIFIED", blk.rows[0][-1])
+
+    def test_active_drift_role_missing_points_to_stack(self):
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "detect_stack_set_drift": {"OperationId": "op-1"},
+            "describe_stack_set_operation": {"StackSetOperation": {"Status": "SUCCEEDED"}},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "1", "Region": "us-east-1", "Status": "CURRENT", "DriftStatus": "DRIFTED",
+                 "StackId": "arn:aws:cloudformation:us-east-1:1:stack/foo/abc"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "1", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        ctx.detect_drift = True
+        def _boom(a, r, s):
+            raise RuntimeError("no such role")
+        ctx.assume = _boom
+        rpt = _run(ct.check_stackset_active_drift, ctx)
+        self.assertIn(ct.BLOCKER, levels(rpt))
+        blk = [f for f in rpt.findings if f.level == ct.BLOCKER][0]
+        self.assertIn("inspect stack", blk.rows[0][-1])
+
     # 9. Config in shared accounts: extra recorder warns; unreachable = UNKNOWN ----
     def test_config_extra_recorder_warns(self):
         ctx = make_ctx()

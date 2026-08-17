@@ -539,6 +539,35 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                                f"All instances CURRENT across {len(names)} AWSControlTower StackSet(s)"))
 
 
+def _resource_drift_detail(ctx: "Context", acct: str, region: str, stack_id) -> str:
+    """Best-effort resource-level drift detail for a drifted instance.
+
+    Assumes ctx.member_role (default AWSControlTowerExecution) into the account and
+    reads describe_stack_resource_drifts. If the role is missing/not assumable, or
+    anything else goes wrong, returns a fallback pointing the operator at the stack
+    to inspect in-account (never raises)."""
+    if not stack_id:
+        return "no StackId on instance — inspect the stack in that account's CloudFormation console"
+    try:
+        cfn = ctx.assume(acct, region, "cloudformation")
+        drifts = _collect(cfn, "describe_stack_resource_drifts", "StackResourceDrifts",
+                          StackName=stack_id,
+                          StackResourceDriftStatusFilters=["MODIFIED", "DELETED"])
+    except Exception as e:  # role missing / AccessDenied / any SDK error -> fall back
+        return (f"'{ctx.member_role}' not assumable in {acct} ({type(e).__name__}) — "
+                f"inspect stack {stack_id} in that account directly")
+    if not drifts:
+        return ("drift reported but no MODIFIED/DELETED resources returned — "
+                "inspect the stack in-account")
+    parts = []
+    for d in drifts[:5]:
+        props = ",".join(p.get("PropertyPath", "")
+                         for p in (d.get("PropertyDifferences") or [])[:4])
+        parts.append(f"{d.get('ResourceType')}/{d.get('LogicalResourceId')}:"
+                     f"{d.get('StackResourceDriftStatus')}" + (f"[{props}]" if props else ""))
+    return "; ".join(parts) + ("" if len(drifts) <= 5 else f" (+{len(drifts) - 5} more)")
+
+
 def check_stackset_active_drift(ctx: Context, report: Report) -> None:
     """OPT-IN (--detect-drift): actively run CloudFormation StackSet drift detection on
     the AWSControlTower* StackSets to catch out-of-band changes to CT-deployed stack
@@ -604,21 +633,25 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
             if i.get("DriftStatus") != "DRIFTED":
                 continue
             acct = i.get("Account", "")
-            row = [name, acct, i.get("Region", ""),
-                   str(i.get("Status") or (i.get("StackInstanceStatus") or {}).get("DetailedStatus")),
-                   str(i.get("DriftStatus"))]
+            region = i.get("Region", "")
+            status = str(i.get("Status") or (i.get("StackInstanceStatus") or {}).get("DetailedStatus"))
             if org_ids is not None and acct and acct not in org_ids:
-                orphaned_drifted.append(row)
+                orphaned_drifted.append([name, acct, region, status, "DRIFTED"])
             else:
-                drifted.append(row)
+                # Drill into what actually drifted (assume role); fall back if the
+                # AWSControlTowerExecution role isn't there.
+                detail = _resource_drift_detail(ctx, acct, region, i.get("StackId"))
+                drifted.append([name, acct, region, status, "DRIFTED", detail])
 
     if drifted:
         report.add(Finding("stackset_drift", BLOCKER,
                            f"{len(drifted)} AWSControlTower* StackSet instance(s) DRIFTED (out-of-band changes)",
                            "Active drift detection found resource-level drift in CT-deployed stacks "
                            "for accounts still enrolled in the org. Drift can cause the landing-zone "
-                           "update to fail or revert customer changes.",
-                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=drifted,
+                           "update to fail or revert customer changes. The last column shows the "
+                           "drifted resource(s) when the role is assumable, else where to look.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift",
+                                 "Drifted resources / where to look"], rows=drifted,
                            remediation="Reconcile the out-of-band changes (revert them, or update the "
                                        "StackSet to match) before upgrading."))
     if orphaned_drifted:
