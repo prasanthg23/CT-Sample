@@ -62,6 +62,13 @@ USAGE
     # (defaults to AWSControlTowerExecution, which the mgmt account can assume):
     python3 ct_preupgrade_precheck.py --member-role AWSControlTowerExecution
 
+    # Opt-in deeper checks (slower / assume into accounts):
+    #   --detect-drift             actively run StackSet drift detection
+    #   --check-member-roles       verify AWSControlTowerExecution in every enrolled account
+    #   --check-kms-policy         heuristically verify the landing-zone CMK key policy
+    #   --check-orphaned-resources (broken LZ) find CT roles that will collide on Repair/Reset
+    python3 ct_preupgrade_precheck.py --check-orphaned-resources
+
 EXIT CODES
     0 = no blockers (safe to proceed, review warnings)
     2 = one or more BLOCKERS (do NOT upgrade until resolved)
@@ -183,6 +190,7 @@ class Context:
         self.drift_timeout: int = 900
         self.check_member_roles: bool = False
         self.check_kms_policy: bool = False
+        self.check_orphaned_resources: bool = False
 
     def discover(self, report: Report) -> bool:
         try:
@@ -1210,6 +1218,112 @@ def check_expected_stacksets(ctx: Context, report: Report) -> None:
                            f"({len(present)} AWSControlTower* StackSet(s) total)"))
 
 
+# Well-known Control Tower-created resources that a Repair/Reset/Update will try to
+# RE-create. If a baseline StackSet was deleted (esp. with "retain stacks") these can
+# linger and then collide ("already exists") when CT recreates them. Names are stable
+# across recent CT versions (see the CT "shared account resources" / "existing resources"
+# docs); the list is intentionally curated (not exhaustive) to stay low-false-positive.
+_BASELINE_ROLE_SS = ["AWSControlTowerBP-BASELINE-ROLES", "AWSControlTowerBP-BASELINE-SERVICE-ROLES"]
+# Each CT-created IAM role mapped to the StackSet(s) that manage it. A role is only a
+# recreate-collision risk if it EXISTS but ALL of its managing StackSets are MISSING — if a
+# managing StackSet is still present, CT updates the role in place (no "already exists").
+_ORPHAN_ROLE_GUARDS = {
+    "AWSControlTowerExecution": ["AWSControlTowerExecutionRole"],
+    "aws-controltower-AdministratorExecutionRole": _BASELINE_ROLE_SS,
+    "aws-controltower-ReadOnlyExecutionRole": _BASELINE_ROLE_SS,
+    "aws-controltower-ConfigRecorderRole": _BASELINE_ROLE_SS,
+    "aws-controltower-ForwardSnsNotificationRole": _BASELINE_ROLE_SS,
+    "aws-controltower-CloudWatchLogsRole": _BASELINE_ROLE_SS,
+}
+
+
+def _probe_orphaned_roles(ctx: Context, acct: str, present_stacksets: set) -> List[List[str]]:
+    """Read-only probe of one account for CT IAM roles that still exist even though the
+    StackSet that manages them is gone (a recreate-collision risk). Raises if the account
+    cannot be assumed at all (the caller marks it UNKNOWN)."""
+    iam = ctx.assume(acct, ctx.region, "iam")  # may raise -> caller handles
+    found: List[List[str]] = []
+    for role, guards in _ORPHAN_ROLE_GUARDS.items():
+        if any(g in present_stacksets for g in guards):
+            continue  # a managing StackSet is present -> CT will update it, not collide
+        try:
+            iam.get_role(RoleName=role)
+            found.append(["IAM role", role])
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "NoSuchEntity":
+                continue  # permission error -> can't confirm; skip
+        except BotoCoreError:
+            continue
+    return found
+
+
+def check_orphaned_ct_resources(ctx: Context, report: Report) -> None:
+    """OPT-IN (--check-orphaned-resources): when the landing zone looks broken (FAILED, or a
+    foundational StackSet is missing), CT-created resources left behind by a deleted baseline
+    StackSet will collide ('already exists') when Repair/Reset/Update recreates them. Scans the
+    shared accounts for the well-known CT resources so they can be cleaned up first.
+
+    Gated on breakage on purpose: on a HEALTHY landing zone these resources are stack-managed and
+    are NOT collision risks, so we don't probe/flag them (avoids false positives)."""
+    if not getattr(ctx, "check_orphaned_resources", False):
+        report.add(Finding("orphaned_resources", INFO,
+                           "Orphaned CT-resource (recreate-collision) scan skipped (opt-in)",
+                           "After a baseline StackSet is deleted, CT-created resources can linger "
+                           "and then collide ('already exists') when Repair/Reset/Update recreates "
+                           "them (a common cause of repair failures on a broken landing zone).",
+                           remediation="Re-run with --check-orphaned-resources (assumes into the "
+                                       "shared accounts; run this when the LZ is broken)."))
+        return
+    # Fetch present AWSControlTower StackSets — used to detect breakage AND to know which
+    # resources are still stack-managed (not orphaned).
+    try:
+        cfn = ctx.session.client("cloudformation", region_name=ctx.region)
+        present = {s["StackSetName"] for s in
+                   _collect(cfn, "list_stack_sets", "Summaries", Status="ACTIVE")}
+    except (ClientError, BotoCoreError):
+        present = set()
+    broken = (ctx.lz.get("status") != "ACTIVE"
+              or any(e not in present for e in _EXPECTED_STACKSETS))
+    if not broken:
+        report.add(Finding("orphaned_resources", PASS,
+                           "Landing zone healthy; CT resources are stack-managed "
+                           "(no recreate-collision scan needed)"))
+        return
+    targets = []
+    if ctx.audit_account:
+        targets.append(("Audit", ctx.audit_account))
+    if ctx.log_archive_account:
+        targets.append(("LogArchive", ctx.log_archive_account))
+    rows, unknown = [], []
+    for label, acct in targets:
+        try:
+            found = _probe_orphaned_roles(ctx, acct, present)
+        except Exception:
+            unknown.append(f"{label} ({acct})")
+            continue
+        for kind, name in found:
+            rows.append([label, acct, kind, name])
+    if rows:
+        report.add(Finding("orphaned_resources", WARNING,
+                           f"{len(rows)} leftover Control Tower IAM role(s) may collide on Repair/Reset",
+                           "The landing zone looks broken and these CT-created IAM roles still exist "
+                           "even though the StackSet that manages them is gone. When Control Tower "
+                           "recreates them during Repair/Reset/Update, CloudFormation can fail with "
+                           "'already exists'. Reconcile/remove them first. (Only roles whose managing "
+                           "StackSet is missing are flagged; S3 buckets are not probed.)",
+                           cols=["Account Type", "Account", "Resource type", "Name"], rows=rows,
+                           remediation="Remove or reconcile the leftover role(s) (see the CT "
+                                       "'existing resources' guidance) before Repair/Reset."))
+    elif unknown:
+        report.add(Finding("orphaned_resources", UNKNOWN,
+                           f"Could not assume into {', '.join(unknown)} to scan for orphaned roles",
+                           "The execution role may itself be missing (part of the breakage).",
+                           remediation="Verify the --member-role exists/assumable in the shared accounts."))
+    else:
+        report.add(Finding("orphaned_resources", PASS,
+                           "No orphaned CT IAM roles (managing StackSet missing) in the shared accounts"))
+
+
 def check_provisioned_product_health(ctx: Context, report: Report) -> None:
     """Account Factory provisions accounts via Service Catalog. Products in ERROR/TAINTED are
     failed enrollments that commonly block updates; UNDER_CHANGE/PLAN_IN_PROGRESS means an
@@ -1336,6 +1450,7 @@ CHECKS = [
     check_stackset_active_drift,
     check_stackset_operations_in_progress,
     check_config_in_shared_accounts,
+    check_orphaned_ct_resources,
     check_customizations,
     check_trusted_access,
     check_delegated_admins,
@@ -1415,6 +1530,9 @@ def main() -> int:
     ap.add_argument("--check-kms-policy", action="store_true",
                     help="Heuristically verify the landing-zone CMK key policy grants CT's "
                          "Config/CloudTrail service principals")
+    ap.add_argument("--check-orphaned-resources", action="store_true",
+                    help="When the LZ looks broken, scan shared accounts for leftover CT resources "
+                         "that would collide ('already exists') when Repair/Reset recreates them")
     ap.add_argument("--strict", action="store_true",
                     help="Treat WARNING and UNKNOWN as blocking too")
     args = ap.parse_args()
@@ -1438,6 +1556,7 @@ def main() -> int:
     ctx.drift_timeout = args.drift_timeout
     ctx.check_member_roles = args.check_member_roles
     ctx.check_kms_policy = args.check_kms_policy
+    ctx.check_orphaned_resources = args.check_orphaned_resources
 
     for check in CHECKS:
         try:

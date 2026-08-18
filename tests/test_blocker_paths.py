@@ -491,6 +491,69 @@ class TestBlockerPaths(unittest.TestCase):
         ctx.check_kms_policy = True
         self.assertIn(ct.PASS, levels(_run(ct.check_kms_key_policy, ctx)))
 
+    # 8i. Opt-in: orphaned CT resources (recreate-collision) -------------------------
+    def test_orphaned_resources_skipped_when_disabled(self):
+        ctx = make_ctx()
+        lv = levels(_run(ct.check_orphaned_ct_resources, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_orphaned_resources_healthy_lz_passes_no_scan(self):
+        cfn = FakeClient({"list_stack_sets": {"Summaries": [
+            {"StackSetName": "AWSControlTowerExecutionRole"},
+            {"StackSetName": "AWSControlTowerBP-BASELINE-ROLES"},
+            {"StackSetName": "AWSControlTowerBP-BASELINE-SERVICE-ROLES"}]}})
+        ctx = make_ctx({"cloudformation": cfn})  # lz status ACTIVE by default
+        ctx.check_orphaned_resources = True
+        lv = levels(_run(ct.check_orphaned_ct_resources, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_orphaned_resources_found_when_broken_warns(self):
+        ctx = make_ctx(lz={"status": "FAILED", "version": "4.0"})
+        ctx.check_orphaned_resources = True
+        def fake_assume(a, r, s):
+            return {
+                "iam": FakeClient({"get_role": {"Role": {}}}),   # every probed role "exists"
+                "config": FakeClient({"describe_configuration_recorders": {"ConfigurationRecorders": []}}),
+                "logs": FakeClient({"describe_log_groups": {"logGroups": []}}),
+                "sns": FakeClient({"list_topics": {"Topics": []}}),
+            }[s]
+        ctx.assume = fake_assume
+        lv = levels(_run(ct.check_orphaned_ct_resources, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_orphaned_resources_not_assumable_is_unknown(self):
+        ctx = make_ctx(lz={"status": "FAILED", "version": "4.0"})
+        ctx.check_orphaned_resources = True
+        def _boom(a, r, s):
+            raise client_error("AccessDenied", "AssumeRole")
+        ctx.assume = _boom
+        lv = levels(_run(ct.check_orphaned_ct_resources, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_orphaned_resources_managed_role_not_flagged(self):
+        # LZ broken (baseline role StackSets missing) but the ExecutionRole StackSet is
+        # present -> AWSControlTowerExecution is stack-managed and must NOT be flagged.
+        cfn = FakeClient({"list_stack_sets": {"Summaries": [
+            {"StackSetName": "AWSControlTowerExecutionRole"}]}})
+        ctx = make_ctx({"cloudformation": cfn}, lz={"status": "FAILED", "version": "4.0"})
+        ctx.check_orphaned_resources = True
+        def fake_assume(a, r, s):
+            c = FakeClient()
+            def get_role(RoleName=None, **k):
+                if RoleName == "AWSControlTowerExecution":
+                    return {"Role": {}}
+                raise client_error("NoSuchEntity", "GetRole")
+            c.get_role = get_role
+            return c
+        ctx.assume = fake_assume
+        lv = levels(_run(ct.check_orphaned_ct_resources, ctx))
+        self.assertNotIn(ct.WARNING, lv)
+        self.assertIn(ct.PASS, lv)
+
     # 9. Config in shared accounts: extra recorder warns; unreachable = UNKNOWN ----
     def test_config_extra_recorder_warns(self):
         ctx = make_ctx()

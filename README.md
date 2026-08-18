@@ -92,6 +92,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | `--detect-drift` | Active StackSet drift | Actually runs CloudFormation drift detection on `AWSControlTower*` StackSets and reports **DRIFTED** instances with the drifted resource(s); without it, stored `DriftStatus` is only as fresh as the last run (often `NOT_CHECKED`) | `cloudformation:DetectStackSetDrift` / `DescribeStackSetOperation` / `DescribeStackResourceDrifts` | BLOCKER (shared) / WARNING (member) |
 | `--check-member-roles` | Member execution-role sweep | Assumes into every enrolled account to confirm `AWSControlTowerExecution` exists/assumable (missing = role drift → LZ can become unavailable) | `sts:AssumeRole` per account | WARNING |
 | `--check-kms-policy` | KMS key-policy | Landing-zone CMK key policy does not grant CT's `config`/`cloudtrail` service principals (heuristic) | `kms:GetKeyPolicy` | WARNING |
+| `--check-orphaned-resources` | Recreate-collision scan | **When the LZ looks broken** (FAILED or a foundational StackSet missing), leftover CT-created resources in the shared accounts (IAM roles, Config recorder, `aws-controltower/CloudTrailLogs`, SNS topics) that will collide (`already exists`) when Repair/Reset recreates them | `sts:AssumeRole` + `iam:GetRole` / `config:DescribeConfigurationRecorders` / `logs:DescribeLogGroups` / `sns:ListTopics` (in shared accounts) | WARNING |
 
 > **Severity model.** Only issues in the **shared accounts** (management, log archive, audit) and
 > org-level configuration **hard-block** the landing-zone update. The same issue in a **member**
@@ -182,6 +183,7 @@ python3 Source/ct_preupgrade_precheck.py \
 python3 Source/ct_preupgrade_precheck.py --detect-drift            # active StackSet drift detection
 python3 Source/ct_preupgrade_precheck.py --check-member-roles      # assume into every enrolled account
 python3 Source/ct_preupgrade_precheck.py --check-kms-policy        # verify CMK key policy grants CT services
+python3 Source/ct_preupgrade_precheck.py --check-orphaned-resources # (broken LZ) find leftover resources that collide on Repair/Reset
 ```
 
 ### Exit codes (for pipeline gating)
@@ -246,7 +248,7 @@ severity fires (e.g. DRIFTED → BLOCKER, OUTDATED StackSet → INFO, unreachabl
 UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
 
 ```bash
-python3 tests/test_blocker_paths.py      # 52 tests, plain unittest (no extra deps)
+python3 tests/test_blocker_paths.py      # 56 tests, plain unittest (no extra deps)
 ```
 
 This complements a live run against a healthy landing zone (which only exercises the PASS/INFO
