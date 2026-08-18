@@ -82,7 +82,8 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 16 | SCP headroom | Target at/near the 10-SCP limit + custom SCP inventory | `organizations:ListPoliciesForTarget` | WARNING |
 | 17 | SCP blocking content | `FullAWSAccess` detached; custom Deny not exempting `AWSControlTowerExecution`; Region restriction via SCP | `organizations:ListPoliciesForTarget` / `DescribePolicy` | WARNING |
 | 18 | In-progress StackSet operations | `RUNNING`/`STOPPING`/`QUEUED` operation on an `AWSControlTower*` StackSet (conflicts with the update) | `cloudformation:ListStackSetOperations` | BLOCKER |
-| 19 | Account Factory product health | Provisioned products in `ERROR`/`TAINTED` (failed enrollment) or `UNDER_CHANGE`/`PLAN_IN_PROGRESS` (mid-flight) | `servicecatalog:SearchProvisionedProducts` | BLOCKER / WARNING |
+| 19 | Foundational StackSets present | Core `AWSControlTower*` StackSets entirely **missing** (broken / partially-deleted landing zone — repair, don't upgrade) | `cloudformation:ListStackSets` | WARNING |
+| 20 | Account Factory product health | Provisioned products in `ERROR`/`TAINTED` (failed enrollment) or `UNDER_CHANGE`/`PLAN_IN_PROGRESS` (mid-flight) | `servicecatalog:SearchProvisionedProducts` | BLOCKER / WARNING |
 
 **Opt-in deeper checks** (off by default — slower or heuristic; enable with a flag):
 
@@ -245,7 +246,7 @@ severity fires (e.g. DRIFTED → BLOCKER, OUTDATED StackSet → INFO, unreachabl
 UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
 
 ```bash
-python3 tests/test_blocker_paths.py      # 50 tests, plain unittest (no extra deps)
+python3 tests/test_blocker_paths.py      # 52 tests, plain unittest (no extra deps)
 ```
 
 This complements a live run against a healthy landing zone (which only exercises the PASS/INFO

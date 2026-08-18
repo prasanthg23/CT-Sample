@@ -359,6 +359,24 @@ class TestBlockerPaths(unittest.TestCase):
         lv = levels(_run(ct.check_stacksets, ctx))
         self.assertNotIn(ct.BLOCKER, lv)
 
+    # 8c. Missing foundational StackSets (broken LZ) ---------------------------------
+    def test_expected_stacksets_missing_warns(self):
+        cfn = FakeClient({"list_stack_sets": {"Summaries": [
+            {"StackSetName": "AWSControlTowerExecutionRole"}]}})  # baseline roles missing
+        ctx = make_ctx({"cloudformation": cfn})
+        lv = levels(_run(ct.check_expected_stacksets, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_expected_stacksets_present_passes(self):
+        cfn = FakeClient({"list_stack_sets": {"Summaries": [
+            {"StackSetName": "AWSControlTowerExecutionRole"},
+            {"StackSetName": "AWSControlTowerBP-BASELINE-ROLES"},
+            {"StackSetName": "AWSControlTowerBP-BASELINE-SERVICE-ROLES"},
+            {"StackSetName": "AWSControlTowerBP-BASELINE-CLOUDWATCH"}]}})
+        ctx = make_ctx({"cloudformation": cfn})
+        self.assertIn(ct.PASS, levels(_run(ct.check_expected_stacksets, ctx)))
+
     # 8d. In-progress StackSet operations --------------------------------------------
     def test_stackset_ops_in_progress_blocks(self):
         cfn = FakeClient({

@@ -36,7 +36,9 @@ WHAT IT CHECKS  (each mapped to a documented LZ-update failure cause; see README
         AWSControlTowerExecution / restricts Regions via SCP (can block the update)
     18. No in-progress (RUNNING/STOPPING/QUEUED) operations on AWSControlTower* StackSets
         (a concurrent StackSet operation conflicts with the landing-zone update)
-    19. Account Factory provisioned products are healthy (ERROR/TAINTED = failed enrollment
+    19. Foundational AWSControlTower StackSets exist (missing baseline StackSets = a broken /
+        partially-deleted landing zone that must be repaired, not upgraded)
+    20. Account Factory provisioned products are healthy (ERROR/TAINTED = failed enrollment
         that blocks updates; UNDER_CHANGE/PLAN_IN_PROGRESS = operation mid-flight)
 
     Severity model: only issues in the shared accounts (management, log archive, audit) and
@@ -1166,6 +1168,48 @@ def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
                            f"No in-progress operations on {len(names)} AWSControlTower StackSet(s)"))
 
 
+# Foundational AWSControlTower StackSets present in EVERY Control Tower landing zone,
+# across versions. Deliberately conservative — version/config-specific StackSets
+# (BASELINE-CONFIG/CLOUDTRAIL in older versions, VPC-ACCOUNT-FACTORY, guardrails,
+# SERVICE-LINKED-ROLE, CLOUDWATCH) are intentionally NOT asserted here to avoid false
+# positives on a healthy landing zone.
+_EXPECTED_STACKSETS = [
+    "AWSControlTowerExecutionRole",
+    "AWSControlTowerBP-BASELINE-ROLES",
+    "AWSControlTowerBP-BASELINE-SERVICE-ROLES",
+]
+
+
+def check_expected_stacksets(ctx: Context, report: Report) -> None:
+    """Detect a broken / partially-deleted landing zone by confirming the foundational
+    AWSControlTower StackSets still exist. The other checks validate the HEALTH of
+    StackSets that exist; this catches ones that are entirely MISSING."""
+    try:
+        cfn = ctx.session.client("cloudformation", region_name=ctx.region)
+        present = {s["StackSetName"] for s in
+                   _collect(cfn, "list_stack_sets", "Summaries", Status="ACTIVE")}
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("expected_stacksets", UNKNOWN,
+                           "Could not list StackSets to verify foundational ones", str(e)))
+        return
+    missing = [e for e in _EXPECTED_STACKSETS if e not in present]
+    if missing:
+        report.add(Finding("expected_stacksets", WARNING,
+                           f"{len(missing)} foundational AWSControlTower StackSet(s) appear missing",
+                           "These core StackSets are expected in every Control Tower landing zone. "
+                           "Their absence usually means the landing zone is broken or was partially "
+                           "deleted — it must be repaired/reset, NOT upgraded. (Heuristic: only "
+                           "version-stable StackSets are asserted; if the landing zone is otherwise "
+                           "FAILED, see the landing-zone status blocker.)",
+                           cols=["Missing StackSet"], rows=[[m] for m in missing],
+                           remediation="Investigate the landing-zone state (a Reset may be required). "
+                                       "Do not upgrade a landing zone with missing baseline StackSets."))
+    else:
+        report.add(Finding("expected_stacksets", PASS,
+                           f"Foundational AWSControlTower StackSets are present "
+                           f"({len(present)} AWSControlTower* StackSet(s) total)"))
+
+
 def check_provisioned_product_health(ctx: Context, report: Report) -> None:
     """Account Factory provisions accounts via Service Catalog. Products in ERROR/TAINTED are
     failed enrollments that commonly block updates; UNDER_CHANGE/PLAN_IN_PROGRESS means an
@@ -1288,6 +1332,7 @@ CHECKS = [
     check_enabled_controls,
     check_enabled_baselines,
     check_stacksets,
+    check_expected_stacksets,
     check_stackset_active_drift,
     check_stackset_operations_in_progress,
     check_config_in_shared_accounts,
