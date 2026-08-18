@@ -1223,38 +1223,136 @@ def check_expected_stacksets(ctx: Context, report: Report) -> None:
 # linger and then collide ("already exists") when CT recreates them. Names are stable
 # across recent CT versions (see the CT "shared account resources" / "existing resources"
 # docs); the list is intentionally curated (not exhaustive) to stay low-false-positive.
-_BASELINE_ROLE_SS = ["AWSControlTowerBP-BASELINE-ROLES", "AWSControlTowerBP-BASELINE-SERVICE-ROLES"]
-# Each CT-created IAM role mapped to the StackSet(s) that manage it. A role is only a
-# recreate-collision risk if it EXISTS but ALL of its managing StackSets are MISSING — if a
-# managing StackSet is still present, CT updates the role in place (no "already exists").
+# StackSets that manage each class of baseline resource (from the CT "Resources created in
+# the shared accounts" doc). A resource is only a recreate-collision risk if it EXISTS but
+# ALL of its managing StackSets are MISSING — if a managing StackSet is present, CT updates
+# the resource in place (no "already exists"). This keeps the scan false-positive-safe.
+_SS_EXEC = ["AWSControlTowerExecutionRole"]
+_SS_ROLES = ["AWSControlTowerBP-BASELINE-ROLES", "AWSControlTowerBP-BASELINE-SERVICE-ROLES"]
+_SS_SECURITY = ["AWSControlTowerSecurityResources", "AWSControlTowerBP-SECURITY-TOPICS"]
+_SS_CONFIG = ["AWSControlTowerBP-BASELINE-CONFIG"]
+_SS_CLOUDWATCH = ["AWSControlTowerBP-BASELINE-CLOUDWATCH"]
+_SS_CLOUDTRAIL = ["AWSControlTowerBP-BASELINE-CLOUDTRAIL", "AWSControlTowerLoggingResources"]
+_SS_S3 = ["AWSControlTowerLoggingResources", "AWSControlTowerBP-CONFIG-CENTRAL-S3-BUCKET"]
+
+# CT-created IAM roles -> the StackSet(s) that manage them.
 _ORPHAN_ROLE_GUARDS = {
-    "AWSControlTowerExecution": ["AWSControlTowerExecutionRole"],
-    "aws-controltower-AdministratorExecutionRole": _BASELINE_ROLE_SS,
-    "aws-controltower-ReadOnlyExecutionRole": _BASELINE_ROLE_SS,
-    "aws-controltower-ConfigRecorderRole": _BASELINE_ROLE_SS,
-    "aws-controltower-ForwardSnsNotificationRole": _BASELINE_ROLE_SS,
-    "aws-controltower-CloudWatchLogsRole": _BASELINE_ROLE_SS,
+    "AWSControlTowerExecution": _SS_EXEC,
+    "aws-controltower-AdministratorExecutionRole": _SS_ROLES,
+    "aws-controltower-ReadOnlyExecutionRole": _SS_ROLES,
+    "aws-controltower-ConfigRecorderRole": _SS_ROLES,
+    "aws-controltower-ForwardSnsNotificationRole": _SS_ROLES,
+    "aws-controltower-CloudWatchLogsRole": _SS_ROLES,
+    "aws-controltower-AuditAdministratorRole": _SS_SECURITY + _SS_ROLES,   # audit account
+    "aws-controltower-AuditReadOnlyRole": _SS_SECURITY + _SS_ROLES,        # audit account
 }
+_ORPHAN_SNS_TOPICS = ["aws-controltower-SecurityNotifications",
+                      "aws-controltower-AggregateSecurityNotifications",
+                      "aws-controltower-AllConfigNotifications"]
+_ORPHAN_S3_PREFIXES = ("aws-controltower-logs-", "aws-controltower-s3-access-logs-",
+                       "aws-controltower-config-logs-", "aws-controltower-config-access-logs-")
 
 
-def _probe_orphaned_roles(ctx: Context, acct: str, present_stacksets: set) -> List[List[str]]:
-    """Read-only probe of one account for CT IAM roles that still exist even though the
-    StackSet that manages them is gone (a recreate-collision risk). Raises if the account
-    cannot be assumed at all (the caller marks it UNKNOWN)."""
-    iam = ctx.assume(acct, ctx.region, "iam")  # may raise -> caller handles
-    found: List[List[str]] = []
+def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[List[str]]:
+    """Read-only probe of one shared account for baseline-created resources that still exist
+    even though the StackSet that manages them is gone (a recreate-collision risk on
+    Repair/Reset). Returns rows [resource type, name]. Raises only if the account can't be
+    assumed at all (caller marks it UNKNOWN); individual services degrade silently.
+    Regional resources are checked in the home region."""
+    def _orphaned(guards: List[str]) -> bool:
+        return not any(g in present for g in guards)
+
+    iam = ctx.assume(acct, ctx.region, "iam")  # may raise -> caller handles (UNKNOWN)
+    rows: List[List[str]] = []
+
     for role, guards in _ORPHAN_ROLE_GUARDS.items():
-        if any(g in present_stacksets for g in guards):
-            continue  # a managing StackSet is present -> CT will update it, not collide
+        if not _orphaned(guards):
+            continue
         try:
             iam.get_role(RoleName=role)
-            found.append(["IAM role", role])
+            rows.append(["IAM role", role])
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") != "NoSuchEntity":
                 continue  # permission error -> can't confirm; skip
         except BotoCoreError:
             continue
-    return found
+
+    if _orphaned(_SS_CONFIG):
+        try:
+            cfg = ctx.assume(acct, ctx.region, "config")
+            for rec in cfg.describe_configuration_recorders().get("ConfigurationRecorders", []):
+                if "aws-controltower" in (rec.get("name") or ""):
+                    rows.append(["Config recorder", rec.get("name", "")])
+            for dc in cfg.describe_delivery_channels().get("DeliveryChannels", []):
+                if "aws-controltower" in (dc.get("name") or ""):
+                    rows.append(["Config delivery channel", dc.get("name", "")])
+        except (ClientError, BotoCoreError):
+            pass
+
+    if _orphaned(_SS_SECURITY):
+        try:
+            sns = ctx.assume(acct, ctx.region, "sns")
+            for t in _collect(sns, "list_topics", "Topics"):
+                name = t.get("TopicArn", "").split(":")[-1]
+                if name in _ORPHAN_SNS_TOPICS:
+                    rows.append(["SNS topic", name])
+        except (ClientError, BotoCoreError):
+            pass
+
+    try:
+        logs = ctx.assume(acct, ctx.region, "logs")
+        if _orphaned(_SS_CLOUDTRAIL):
+            for lg in _collect(logs, "describe_log_groups", "logGroups",
+                               logGroupNamePrefix="aws-controltower/CloudTrailLogs"):
+                rows.append(["CloudWatch log group", lg.get("logGroupName", "")])
+        if _orphaned(_SS_CLOUDWATCH):
+            for lg in _collect(logs, "describe_log_groups", "logGroups",
+                               logGroupNamePrefix="/aws/lambda/aws-controltower-NotificationForwarder"):
+                rows.append(["CloudWatch log group", lg.get("logGroupName", "")])
+    except (ClientError, BotoCoreError):
+        pass
+
+    if _orphaned(_SS_CLOUDWATCH):
+        try:
+            lam = ctx.assume(acct, ctx.region, "lambda")
+            try:
+                lam.get_function(FunctionName="aws-controltower-NotificationForwarder")
+                rows.append(["Lambda function", "aws-controltower-NotificationForwarder"])
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") not in ("ResourceNotFoundException", "404"):
+                    pass
+            except BotoCoreError:
+                pass
+        except (ClientError, BotoCoreError):
+            pass
+        try:
+            ev = ctx.assume(acct, ctx.region, "events")
+            for r in _collect(ev, "list_rules", "Rules",
+                              NamePrefix="aws-controltower-ConfigComplianceChangeEventRule"):
+                rows.append(["EventBridge rule", r.get("Name", "")])
+        except (ClientError, BotoCoreError):
+            pass
+
+    if _orphaned(_SS_CLOUDTRAIL):
+        try:
+            ct_cli = ctx.assume(acct, ctx.region, "cloudtrail")
+            for tr in ct_cli.describe_trails(
+                    trailNameList=["aws-controltower-BaselineCloudTrail"]).get("trailList", []):
+                rows.append(["CloudTrail trail", tr.get("Name", "aws-controltower-BaselineCloudTrail")])
+        except (ClientError, BotoCoreError):
+            pass
+
+    if _orphaned(_SS_S3):
+        try:
+            s3 = ctx.assume(acct, ctx.region, "s3")
+            for b in s3.list_buckets().get("Buckets", []):
+                nm = b.get("Name", "")
+                if nm.startswith(_ORPHAN_S3_PREFIXES):
+                    rows.append(["S3 bucket", nm])
+        except (ClientError, BotoCoreError):
+            pass
+
+    return rows
 
 
 def check_orphaned_ct_resources(ctx: Context, report: Report) -> None:
@@ -1297,7 +1395,7 @@ def check_orphaned_ct_resources(ctx: Context, report: Report) -> None:
     rows, unknown = [], []
     for label, acct in targets:
         try:
-            found = _probe_orphaned_roles(ctx, acct, present)
+            found = _probe_orphaned_resources(ctx, acct, present)
         except Exception:
             unknown.append(f"{label} ({acct})")
             continue
@@ -1305,23 +1403,24 @@ def check_orphaned_ct_resources(ctx: Context, report: Report) -> None:
             rows.append([label, acct, kind, name])
     if rows:
         report.add(Finding("orphaned_resources", WARNING,
-                           f"{len(rows)} leftover Control Tower IAM role(s) may collide on Repair/Reset",
-                           "The landing zone looks broken and these CT-created IAM roles still exist "
-                           "even though the StackSet that manages them is gone. When Control Tower "
-                           "recreates them during Repair/Reset/Update, CloudFormation can fail with "
-                           "'already exists'. Reconcile/remove them first. (Only roles whose managing "
-                           "StackSet is missing are flagged; S3 buckets are not probed.)",
+                           f"{len(rows)} leftover Control Tower resource(s) may collide on Repair/Reset",
+                           "The landing zone looks broken and these CT-created resources still exist in "
+                           "the shared accounts even though the StackSet that manages them is gone. When "
+                           "Control Tower recreates them during Repair/Reset/Update, CloudFormation can "
+                           "fail with 'already exists'. Reconcile/remove them first. (Only resources "
+                           "whose managing StackSet is missing are flagged; regional resources are "
+                           "checked in the home region.)",
                            cols=["Account Type", "Account", "Resource type", "Name"], rows=rows,
-                           remediation="Remove or reconcile the leftover role(s) (see the CT "
+                           remediation="Remove or reconcile the leftover resource(s) (see the CT "
                                        "'existing resources' guidance) before Repair/Reset."))
     elif unknown:
         report.add(Finding("orphaned_resources", UNKNOWN,
-                           f"Could not assume into {', '.join(unknown)} to scan for orphaned roles",
+                           f"Could not assume into {', '.join(unknown)} to scan for orphaned resources",
                            "The execution role may itself be missing (part of the breakage).",
                            remediation="Verify the --member-role exists/assumable in the shared accounts."))
     else:
         report.add(Finding("orphaned_resources", PASS,
-                           "No orphaned CT IAM roles (managing StackSet missing) in the shared accounts"))
+                           "No orphaned CT resources (managing StackSet missing) in the shared accounts"))
 
 
 def check_provisioned_product_health(ctx: Context, report: Report) -> None:

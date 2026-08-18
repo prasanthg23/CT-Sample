@@ -513,12 +513,11 @@ class TestBlockerPaths(unittest.TestCase):
         ctx = make_ctx(lz={"status": "FAILED", "version": "4.0"})
         ctx.check_orphaned_resources = True
         def fake_assume(a, r, s):
-            return {
-                "iam": FakeClient({"get_role": {"Role": {}}}),   # every probed role "exists"
-                "config": FakeClient({"describe_configuration_recorders": {"ConfigurationRecorders": []}}),
-                "logs": FakeClient({"describe_log_groups": {"logGroups": []}}),
-                "sns": FakeClient({"list_topics": {"Topics": []}}),
-            }[s]
+            clients = {
+                "iam": FakeClient({"get_role": {"Role": {}}}),  # every probed role "exists"
+                "lambda": FakeClient(errors={"get_function": client_error("ResourceNotFoundException", "GetFunction")}),
+            }
+            return clients.get(s, FakeClient())  # other services: empty responses
         ctx.assume = fake_assume
         lv = levels(_run(ct.check_orphaned_ct_resources, ctx))
         self.assertIn(ct.WARNING, lv)
@@ -542,13 +541,17 @@ class TestBlockerPaths(unittest.TestCase):
         ctx = make_ctx({"cloudformation": cfn}, lz={"status": "FAILED", "version": "4.0"})
         ctx.check_orphaned_resources = True
         def fake_assume(a, r, s):
-            c = FakeClient()
-            def get_role(RoleName=None, **k):
-                if RoleName == "AWSControlTowerExecution":
-                    return {"Role": {}}
-                raise client_error("NoSuchEntity", "GetRole")
-            c.get_role = get_role
-            return c
+            if s == "iam":
+                c = FakeClient()
+                def get_role(RoleName=None, **k):
+                    if RoleName == "AWSControlTowerExecution":
+                        return {"Role": {}}
+                    raise client_error("NoSuchEntity", "GetRole")
+                c.get_role = get_role
+                return c
+            if s == "lambda":
+                return FakeClient(errors={"get_function": client_error("ResourceNotFoundException", "GetFunction")})
+            return FakeClient()  # config/sns/logs/events/cloudtrail/s3: empty
         ctx.assume = fake_assume
         lv = levels(_run(ct.check_orphaned_ct_resources, ctx))
         self.assertNotIn(ct.WARNING, lv)
