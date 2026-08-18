@@ -557,6 +557,20 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertNotIn(ct.WARNING, lv)
         self.assertIn(ct.PASS, lv)
 
+    # 8j. Doc references -----------------------------------------------------------
+    def test_doc_map_urls_are_ct_userguide(self):
+        self.assertTrue(ct._CHECK_DOCS)
+        base = "https://docs.aws.amazon.com/controltower/latest/userguide/"
+        for cid, url in ct._CHECK_DOCS.items():
+            self.assertTrue(url.startswith(base), f"{cid} -> {url}")
+            self.assertTrue(url.endswith(".html"), f"{cid} -> {url}")
+
+    def test_render_includes_doc_reference(self):
+        rpt = ct.Report()
+        rpt.add(ct.Finding("lz_status", ct.BLOCKER, "Landing zone is in a FAILED state"))
+        out = ct.render_text(rpt, make_ctx())
+        self.assertIn("DOC: https://docs.aws.amazon.com/controltower", out)
+
     # 9. Config in shared accounts: extra recorder warns; unreachable = UNKNOWN ----
     def test_config_extra_recorder_warns(self):
         ctx = make_ctx()

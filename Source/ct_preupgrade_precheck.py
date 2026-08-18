@@ -120,6 +120,7 @@ class Finding:
     rows: List[List[str]] = field(default_factory=list)
     cols: List[str] = field(default_factory=list)
     remediation: str = ""
+    doc: str = ""
 
 
 @dataclass
@@ -146,6 +147,43 @@ class Report:
 
 
 DOC = "https://docs.aws.amazon.com/controltower/latest/userguide"
+
+# Per-check AWS Control Tower documentation references. Every URL below was verified to be a
+# real page under the CT User Guide (no guessed slugs). Rendered as a "DOC:" line per finding
+# and included in the JSON report so each section is traceable to authoritative guidance.
+_CHECK_DOCS = {
+    "discovery": f"{DOC}/troubleshooting.html",
+    "lz_status": f"{DOC}/troubleshooting.html",
+    "lz_drift": f"{DOC}/drift.html",
+    "update_available": f"{DOC}/lz-version-selection.html",
+    "managed_accounts": f"{DOC}/account-factory-considerations.html",
+    "closed_with_pp": f"{DOC}/troubleshooting.html",
+    "controls_drift": f"{DOC}/resolving-drift.html",
+    "baselines_drift": f"{DOC}/resolve-drift.html",
+    "stacksets": f"{DOC}/drift.html",
+    "stacksets_member": f"{DOC}/drift.html",
+    "stacksets_orphaned": f"{DOC}/shared-account-resources.html",
+    "stackset_drift": f"{DOC}/drift.html",
+    "stackset_drift_member": f"{DOC}/drift.html",
+    "stackset_drift_orphaned": f"{DOC}/shared-account-resources.html",
+    "stackset_ops": f"{DOC}/troubleshooting.html",
+    "config_shared": f"{DOC}/existing-config-resources.html",
+    "customizations": f"{DOC}/configuration-updates.html",
+    "trusted_access": f"{DOC}/governance-drift.html",
+    "delegated_admins": f"{DOC}/governance-drift.html",
+    "iam_roles": f"{DOC}/roles-how.html",
+    "kms_key": f"{DOC}/configure-shared-accounts.html",
+    "kms_policy": f"{DOC}/configure-shared-accounts.html",
+    "sts_regions": f"{DOC}/troubleshooting.html",
+    "scp_headroom": f"{DOC}/resolve-drift.html",
+    "scp_blocking": f"{DOC}/resolve-drift.html",
+    "scp_custom": f"{DOC}/resolve-drift.html",
+    "expected_stacksets": f"{DOC}/shared-account-resources.html",
+    "orphaned_resources": f"{DOC}/existing-config-resources.html",
+    "provisioned_products": f"{DOC}/updating-account-factory-accounts.html",
+    "provisioned_products_inprogress": f"{DOC}/updating-account-factory-accounts.html",
+    "member_roles": f"{DOC}/roles-how.html",
+}
 
 
 # --------------------------------------------------------------------------------------
@@ -1204,14 +1242,18 @@ def check_expected_stacksets(ctx: Context, report: Report) -> None:
     if missing:
         report.add(Finding("expected_stacksets", WARNING,
                            f"{len(missing)} foundational AWSControlTower StackSet(s) appear missing",
-                           "These core StackSets are expected in every Control Tower landing zone. "
-                           "Their absence usually means the landing zone is broken or was partially "
-                           "deleted — it must be repaired/reset, NOT upgraded. (Heuristic: only "
-                           "version-stable StackSets are asserted; if the landing zone is otherwise "
+                           "These core StackSets are expected in every Control Tower landing zone; "
+                           "their absence indicates the landing zone is broken or was partially "
+                           "deleted. Update, Reset, and Repair all run the same UpdateLandingZone "
+                           "workflow that re-deploys these baseline StackSets, so none of them will "
+                           "succeed until the landing zone is healthy again. (Heuristic: only "
+                           "version-stable StackSets are asserted; if the landing zone is also "
                            "FAILED, see the landing-zone status blocker.)",
                            cols=["Missing StackSet"], rows=[[m] for m in missing],
-                           remediation="Investigate the landing-zone state (a Reset may be required). "
-                                       "Do not upgrade a landing zone with missing baseline StackSets."))
+                           remediation="Resolve the landing-zone failure first. Note: ResetLandingZone "
+                                       "requires the latest landing zone version and does not change "
+                                       "the version; UpdateLandingZone changes config/version — both "
+                                       "use the same backend workflow and re-deploy these StackSets."))
     else:
         report.add(Finding("expected_stacksets", PASS,
                            f"Foundational AWSControlTower StackSets are present "
@@ -1595,6 +1637,9 @@ def render_text(report: Report, ctx: Context) -> str:
                     lines.append(f"          - {' | '.join(str(x) for x in r)}")
             if f.remediation:
                 lines.append(f"        FIX: {f.remediation}")
+            doc = f.doc or _CHECK_DOCS.get(f.check, "")
+            if doc:
+                lines.append(f"        DOC: {doc}")
     lines.append("\n" + "=" * 78)
     n_block = len(report.by_level(BLOCKER))
     n_unk = len(report.by_level(UNKNOWN))
@@ -1666,8 +1711,12 @@ def main() -> int:
 
     print(render_text(report, ctx))
     if args.json:
+        def _as_dict(f: Finding) -> dict:
+            d = asdict(f)
+            d["doc"] = f.doc or _CHECK_DOCS.get(f.check, "")
+            return d
         with open(args.json, "w") as fh:
-            json.dump({"findings": [asdict(f) for f in report.findings]}, fh, indent=2)
+            json.dump({"findings": [_as_dict(f) for f in report.findings]}, fh, indent=2)
         print(f"\nJSON report written to {args.json}")
 
     if report.has_blockers:
