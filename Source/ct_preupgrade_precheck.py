@@ -1244,16 +1244,20 @@ def check_expected_stacksets(ctx: Context, report: Report) -> None:
                            f"{len(missing)} foundational AWSControlTower StackSet(s) appear missing",
                            "These core StackSets are expected in every Control Tower landing zone; "
                            "their absence indicates the landing zone is broken or was partially "
-                           "deleted. Update, Reset, and Repair all run the same UpdateLandingZone "
-                           "workflow that re-deploys these baseline StackSets, so none of them will "
-                           "succeed until the landing zone is healthy again. (Heuristic: only "
+                           "deleted. All landing-zone operations (Update/upgrade, Reset, Repair, and "
+                           "the console Retry on a failed dashboard) run the same UpdateLandingZone "
+                           "backend workflow, which re-creates these baseline StackSets — so a normal "
+                           "version upgrade would also attempt to re-create them. Treat this as a "
+                           "broken landing zone to repair, not a routine upgrade. (Heuristic: only "
                            "version-stable StackSets are asserted; if the landing zone is also "
                            "FAILED, see the landing-zone status blocker.)",
                            cols=["Missing StackSet"], rows=[[m] for m in missing],
-                           remediation="Resolve the landing-zone failure first. Note: ResetLandingZone "
-                                       "requires the latest landing zone version and does not change "
-                                       "the version; UpdateLandingZone changes config/version — both "
-                                       "use the same backend workflow and re-deploy these StackSets."))
+                           remediation="Retry/resolve the failed landing-zone operation to re-create "
+                                       "the missing StackSets (all landing-zone operations run the "
+                                       "same UpdateLandingZone workflow). AWS Control Tower does not "
+                                       "roll back a failed update and can leave the landing zone in an "
+                                       "indeterminate state — if retrying does not resolve it, contact "
+                                       "AWS Support."))
     else:
         report.add(Finding("expected_stacksets", PASS,
                            f"Foundational AWSControlTower StackSets are present "
