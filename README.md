@@ -83,7 +83,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 17 | SCP blocking content | `FullAWSAccess` detached; custom Deny not exempting `AWSControlTowerExecution`; Region restriction via SCP | `organizations:ListPoliciesForTarget` / `DescribePolicy` | WARNING |
 | 18 | In-progress StackSet operations | `RUNNING`/`STOPPING`/`QUEUED` operation on an `AWSControlTower*` StackSet (conflicts with the update) | `cloudformation:ListStackSetOperations` | BLOCKER |
 | 19 | Foundational StackSets present | Core `AWSControlTower*` StackSets entirely **missing** (broken / partially-deleted landing zone — repair, don't upgrade) | `cloudformation:ListStackSets` | WARNING |
-| 20 | Account Factory product health | Provisioned products in `ERROR`/`TAINTED` (failed enrollment) or `UNDER_CHANGE`/`PLAN_IN_PROGRESS` (mid-flight) | `servicecatalog:SearchProvisionedProducts` | BLOCKER / WARNING |
+| 20 | Account Factory product health | Provisioned products in `ERROR`/`TAINTED` (inconsistent account — cannot update via Account Factory, can block controls on its OU; account-re-baselining issue, not an LZ-update blocker) or `UNDER_CHANGE`/`PLAN_IN_PROGRESS` (mid-flight) | `servicecatalog:SearchProvisionedProducts` | WARNING |
 
 **Opt-in deeper checks** (off by default — slower or heuristic; enable with a flag):
 

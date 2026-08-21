@@ -1471,8 +1471,11 @@ def check_orphaned_ct_resources(ctx: Context, report: Report) -> None:
 
 def check_provisioned_product_health(ctx: Context, report: Report) -> None:
     """Account Factory provisions accounts via Service Catalog. Products in ERROR/TAINTED are
-    failed enrollments that commonly block updates; UNDER_CHANGE/PLAN_IN_PROGRESS means an
-    Account Factory operation is mid-flight."""
+    accounts in an inconsistent state that cannot be updated via Account Factory/Service Catalog
+    (and can block enabling controls on their OU) — an account-re-baselining WARNING, not a
+    landing-zone-update blocker. The documented hard block is a provisioned product on a
+    CLOSED/SUSPENDED account, which is handled by check_suspended_with_provisioned_product.
+    UNDER_CHANGE/PLAN_IN_PROGRESS means an Account Factory operation is mid-flight."""
     try:
         sc = ctx.session.client("servicecatalog", region_name=ctx.region)
         pps = _collect(sc, "search_provisioned_products", "ProvisionedProducts",
@@ -1484,14 +1487,19 @@ def check_provisioned_product_health(ctx: Context, report: Report) -> None:
     bad = [p for p in pps if p.get("Status") in ("ERROR", "TAINTED")]
     inprog = [p for p in pps if p.get("Status") in ("UNDER_CHANGE", "PLAN_IN_PROGRESS")]
     if bad:
-        report.add(Finding("provisioned_products", BLOCKER,
+        report.add(Finding("provisioned_products", WARNING,
                            f"{len(bad)} Account Factory provisioned product(s) in ERROR/TAINTED",
-                           "ERROR/TAINTED Account Factory products are failed enrollments/updates "
-                           "that commonly block landing-zone updates and account re-baselining.",
+                           "These accounts are in an inconsistent state and cannot be updated via "
+                           "Account Factory / Service Catalog; a TAINTED account can also block "
+                           "enabling controls on its OU. This affects account re-baselining (the "
+                           "per-account / Re-register OU phase), not the landing-zone update itself, "
+                           "so it is a WARNING. (The documented hard blocker is a provisioned product "
+                           "on a CLOSED/SUSPENDED account — see the suspended-account check.)",
                            cols=["Product", "Status", "Type"],
                            rows=[[p.get("Name", ""), p.get("Status", ""), p.get("Type", "")]
                                  for p in bad],
-                           remediation="Repair or terminate the failed provisioned product(s) first."))
+                           remediation="Repair or terminate the failed provisioned product(s) before "
+                                       "re-baselining the affected accounts."))
     if inprog:
         report.add(Finding("provisioned_products_inprogress", WARNING,
                            f"{len(inprog)} provisioned product(s) UNDER_CHANGE/PLAN_IN_PROGRESS",

@@ -399,11 +399,13 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertNotIn(ct.BLOCKER, lv)
 
     # 8e. Account Factory provisioned-product health ---------------------------------
-    def test_provisioned_product_tainted_blocks(self):
+    def test_provisioned_product_tainted_warns(self):
         sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
             {"Name": "acct-x", "Status": "TAINTED", "Type": "CONTROL_TOWER_ACCOUNT"}]}})
         ctx = make_ctx({"servicecatalog": sc})
-        self.assertIn(ct.BLOCKER, levels(_run(ct.check_provisioned_product_health, ctx)))
+        lv = levels(_run(ct.check_provisioned_product_health, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
 
     def test_provisioned_product_under_change_warns(self):
         sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
