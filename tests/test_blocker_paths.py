@@ -718,5 +718,48 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.BLOCKER, levels(rpt))
 
 
+class TestColorRendering(unittest.TestCase):
+    """The severity coloring is opt-in, TTY-gated, and never leaks into plain output."""
+
+    def _report(self):
+        rpt = ct.Report()
+        rpt.add(ct.Finding("lz_status", ct.BLOCKER, "Landing zone is in a FAILED state"))
+        rpt.add(ct.Finding("managed_accounts", ct.WARNING, "1 suspended account"))
+        rpt.add(ct.Finding("update_available", ct.INFO, "v3.3 -> v4.0 available"))
+        rpt.add(ct.Finding("iam_roles", ct.PASS, "All required roles present"))
+        return rpt
+
+    def test_color_true_emits_ansi(self):
+        out = ct.render_text(self._report(), make_ctx(), use_color=True)
+        self.assertIn("\033[", out)
+        self.assertIn(ct.COLOR[ct.BLOCKER], out)
+
+    def test_color_false_emits_no_ansi(self):
+        out = ct.render_text(self._report(), make_ctx(), use_color=False)
+        self.assertNotIn("\033[", out)
+
+    def test_default_is_plain(self):
+        # default arg must stay no-color so piped/redirected output is clean
+        self.assertNotIn("\033[", ct.render_text(self._report(), make_ctx()))
+
+    def test_supports_color_modes(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            self.assertFalse(ct._supports_color("never"))
+            self.assertTrue(ct._supports_color("always"))
+
+    def test_no_color_env_overrides_always(self):
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertFalse(ct._supports_color("always"))
+
+    def test_auto_follows_tty(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            with mock.patch.object(ct.sys.stdout, "isatty", return_value=False):
+                self.assertFalse(ct._supports_color("auto"))
+            with mock.patch.object(ct.sys.stdout, "isatty", return_value=True):
+                self.assertTrue(ct._supports_color("auto"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

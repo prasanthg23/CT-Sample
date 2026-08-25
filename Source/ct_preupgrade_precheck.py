@@ -89,6 +89,7 @@ REQUIRED PERMISSIONS (management account, read-only)
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
@@ -1622,11 +1623,46 @@ CHECKS = [
 # --------------------------------------------------------------------------------------
 ICON = {BLOCKER: "[X]", WARNING: "[!]", INFO: "[i]", PASS: "[OK]", UNKNOWN: "[?]"}
 
+# ANSI colors per severity. Emitted only when writing to an interactive terminal
+# (see _supports_color); piped/redirected output and the --json file stay plain, so
+# pipeline logs and downstream parsing are never polluted with escape codes.
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+COLOR = {
+    BLOCKER: "\033[1;31m",  # bold red
+    WARNING: "\033[33m",    # yellow
+    UNKNOWN: "\033[35m",    # magenta
+    INFO:    "\033[36m",    # cyan
+    PASS:    "\033[32m",    # green
+}
 
-def render_text(report: Report, ctx: Context) -> str:
+
+def _supports_color(mode: str) -> bool:
+    """Whether to emit ANSI color. mode: 'auto' | 'always' | 'never'."""
+    if mode == "never":
+        return False
+    if os.environ.get("NO_COLOR") is not None:  # https://no-color.org/
+        return False
+    if mode == "always":
+        return True
+    return sys.stdout.isatty()  # auto: only for an interactive terminal
+
+
+def _c(text: str, level: str, use_color: bool, bold: bool = False) -> str:
+    """Wrap text in the severity color when coloring is enabled; otherwise return as-is."""
+    if not use_color:
+        return text
+    prefix = COLOR.get(level, "")
+    if bold and _BOLD not in prefix:
+        prefix = _BOLD + prefix
+    return f"{prefix}{text}{_RESET}" if prefix else text
+
+
+def render_text(report: Report, ctx: Context, use_color: bool = False) -> str:
     lines = []
     lines.append("=" * 78)
-    lines.append("AWS Control Tower — Pre-Upgrade Precheck")
+    lines.append((_BOLD + "AWS Control Tower — Pre-Upgrade Precheck" + _RESET)
+                 if use_color else "AWS Control Tower — Pre-Upgrade Precheck")
     lines.append(f"  Management account : {ctx.mgmt_account}")
     lines.append(f"  Home region        : {ctx.region}")
     lines.append(f"  Landing zone       : v{ctx.lz.get('version')} "
@@ -1637,10 +1673,10 @@ def render_text(report: Report, ctx: Context) -> str:
         group = report.by_level(level)
         if not group:
             continue
-        lines.append(f"\n{ICON[level]} {level}  ({len(group)})")
+        lines.append("\n" + _c(f"{ICON[level]} {level}  ({len(group)})", level, use_color, bold=True))
         lines.append("-" * 78)
         for f in group:
-            lines.append(f"  {ICON[level]} {f.summary}")
+            lines.append("  " + _c(f"{ICON[level]} {f.summary}", level, use_color))
             if f.detail:
                 lines.append(f"        {f.detail}")
             if f.rows:
@@ -1657,11 +1693,11 @@ def render_text(report: Report, ctx: Context) -> str:
     n_unk = len(report.by_level(UNKNOWN))
     n_warn = len(report.by_level(WARNING))
     if n_block:
-        lines.append(f"RESULT: NOT SAFE TO UPGRADE — {n_block} blocker(s), "
-                     f"{n_warn} warning(s), {n_unk} unverified.")
+        lines.append(_c(f"RESULT: NOT SAFE TO UPGRADE — {n_block} blocker(s), "
+                        f"{n_warn} warning(s), {n_unk} unverified.", BLOCKER, use_color, bold=True))
     else:
-        lines.append(f"RESULT: No blockers. {n_warn} warning(s), {n_unk} unverified — "
-                     "review before proceeding.")
+        lines.append(_c(f"RESULT: No blockers. {n_warn} warning(s), {n_unk} unverified — "
+                        "review before proceeding.", PASS, use_color, bold=True))
     lines.append("=" * 78)
     return "\n".join(lines)
 
@@ -1691,7 +1727,12 @@ def main() -> int:
                          "that would collide ('already exists') when Repair/Reset recreates them")
     ap.add_argument("--strict", action="store_true",
                     help="Treat WARNING and UNKNOWN as blocking too")
+    ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                    help="Colorize the text report: auto (TTY only, default), always, or never "
+                         "(also honors the NO_COLOR environment variable)")
     args = ap.parse_args()
+
+    use_color = _supports_color(args.color)
 
     session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
     region = args.region or session.region_name
@@ -1702,7 +1743,7 @@ def main() -> int:
     report = Report()
     ctx = Context(session, region, args.member_role)
     if not ctx.discover(report):
-        print(render_text(report, ctx))
+        print(render_text(report, ctx, use_color))
         return 3
     if args.audit_account:
         ctx.audit_account = args.audit_account
@@ -1721,7 +1762,7 @@ def main() -> int:
             report.add(Finding(check.__name__, UNKNOWN,
                                f"Check '{check.__name__}' errored", repr(e)))
 
-    print(render_text(report, ctx))
+    print(render_text(report, ctx, use_color))
     if args.json:
         def _as_dict(f: Finding) -> dict:
             d = asdict(f)

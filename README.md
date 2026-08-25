@@ -184,7 +184,18 @@ python3 Source/ct_preupgrade_precheck.py --detect-drift            # active Stac
 python3 Source/ct_preupgrade_precheck.py --check-member-roles      # assume into every enrolled account
 python3 Source/ct_preupgrade_precheck.py --check-kms-policy        # verify CMK key policy grants CT services
 python3 Source/ct_preupgrade_precheck.py --check-orphaned-resources # (broken LZ) find leftover resources that collide on Repair/Reset
+
+# Output formatting:
+python3 Source/ct_preupgrade_precheck.py --color always            # force color (e.g. when piping to a pager)
+python3 Source/ct_preupgrade_precheck.py --color never             # disable color
 ```
+
+The text report is color-coded by severity (BLOCKER red, WARNING yellow, UNVERIFIED magenta,
+INFO cyan, PASS green), with `[X]`/`[!]`/`[?]`/`[i]`/`[OK]` markers kept as an accessible,
+color-independent fallback. Color is applied only when the output is an interactive terminal
+(`--color auto`, the default); it is suppressed automatically when the output is piped or
+redirected, when `--color never` is used, or when the `NO_COLOR` environment variable is set. The
+`--json` report is never colorized.
 
 ### Exit codes (for pipeline gating)
 
