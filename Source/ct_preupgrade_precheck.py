@@ -173,6 +173,7 @@ _CHECK_DOCS = {
     "trusted_access": f"{DOC}/governance-drift.html",
     "delegated_admins": f"{DOC}/governance-drift.html",
     "iam_roles": f"{DOC}/roles-how.html",
+    "cloudtrail_role_v4": f"{DOC}/key-changes-lz-v4.html",
     "kms_key": f"{DOC}/configure-shared-accounts.html",
     "kms_policy": f"{DOC}/configure-shared-accounts.html",
     "sts_regions": f"{DOC}/troubleshooting.html",
@@ -853,12 +854,37 @@ def check_customizations(ctx: Context, report: Report) -> None:
 
 
 # Required Control Tower management-account IAM roles (must exist for updates/repairs).
-_REQUIRED_ROLES = [
+# Core Control Tower management-account service roles — required on every landing zone version.
+_CORE_MGMT_ROLES = [
     "AWSControlTowerAdmin",
     "AWSControlTowerCloudTrailRole",
     "AWSControlTowerStackSetRole",
-    "AWSControlTowerConfigAggregatorRoleForOrganizations",
 ]
+# The organization AWS Config aggregator role is required only on landing zone versions < 4.0.
+# In landing zone 4.0+ the AWS Config integration is optional, and the organization/account
+# aggregators (and this role) are replaced by a service-linked Config aggregator — so the role is
+# legitimately absent and its absence must NOT block an update.
+#   https://docs.aws.amazon.com/controltower/latest/userguide/config-updates-v4.html
+#   https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html
+_CONFIG_AGGREGATOR_ROLE = "AWSControlTowerConfigAggregatorRoleForOrganizations"
+# Back-compat alias: the full pre-4.0 required set.
+_REQUIRED_ROLES = _CORE_MGMT_ROLES + [_CONFIG_AGGREGATOR_ROLE]
+
+
+def _lz_major_version(ctx: Context) -> Optional[int]:
+    """Major version of the deployed landing zone ('4.0' -> 4). None if unknown/unparseable."""
+    try:
+        return int(str(ctx.lz.get("version")).split(".")[0])
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _latest_major_version(ctx: Context) -> Optional[int]:
+    """Major version of the latest available landing zone. None if unknown/unparseable."""
+    try:
+        return int(str(ctx.lz.get("latestAvailableVersion")).split(".")[0])
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 # Trusted (service) access that an operating Control Tower landing zone relies on.
 _REQUIRED_TRUSTED_SERVICES = [
@@ -922,14 +948,26 @@ def check_delegated_admins(ctx: Context, report: Report) -> None:
 
 
 def check_required_iam_roles(ctx: Context, report: Report) -> None:
-    """The Control Tower management-account service roles must exist for updates/repairs."""
+    """The Control Tower management-account service roles must exist for updates/repairs.
+
+    The three core roles are required on every version. The organization Config aggregator role
+    is required only on landing zone versions < 4.0 — in 4.0+ AWS Config is optional and the
+    aggregator is service-linked, so its absence is expected and must not block (see
+    config-updates-v4 / key-changes-lz-v4)."""
     try:
         iam = ctx.session.client("iam", region_name=ctx.region)
     except (ClientError, BotoCoreError) as e:
         report.add(Finding("iam_roles", UNKNOWN, "Could not create IAM client", str(e)))
         return
+    major = _lz_major_version(ctx)
+    roles = list(_CORE_MGMT_ROLES)
+    # Only require the org Config aggregator role on a known pre-4.0 landing zone. On 4.0+ (or an
+    # unknown version, to avoid a false blocker) its absence is not treated as a problem.
+    aggregator_required = major is not None and major < 4
+    if aggregator_required:
+        roles.append(_CONFIG_AGGREGATOR_ROLE)
     missing, unknown = [], []
-    for role in _REQUIRED_ROLES:
+    for role in roles:
         try:
             iam.get_role(RoleName=role)
         except ClientError as e:
@@ -950,8 +988,51 @@ def check_required_iam_roles(ctx: Context, report: Report) -> None:
                            "Could not verify one or more required IAM roles",
                            ", ".join(unknown)))
     else:
-        report.add(Finding("iam_roles", PASS,
-                           "All required Control Tower management-account roles present"))
+        note = "All required Control Tower management-account roles present"
+        if not aggregator_required:
+            note += (f" ({_CONFIG_AGGREGATOR_ROLE} not required on landing zone "
+                     f"v{ctx.lz.get('version')}: AWS Config aggregator is service-linked in v4.0+)")
+        report.add(Finding("iam_roles", PASS, note))
+
+
+def check_cloudtrail_role_v4_policy(ctx: Context, report: Report) -> None:
+    """v4.0 upgrade prerequisite: `AWSControlTowerCloudTrailRole` must use the AWS managed policy
+    `AWSControlTowerCloudTrailRolePolicy` (not the legacy inline policy) before a landing zone is
+    updated to version 4.0 via the API. Only evaluated when an upgrade to 4.0+ is actually
+    available (deployed < 4.0 and latest >= 4.0).
+    Doc: key-changes-lz-v4.html."""
+    deployed = _lz_major_version(ctx)
+    latest = _latest_major_version(ctx)
+    if latest is None or latest < 4 or (deployed is not None and deployed >= 4):
+        return  # not upgrading into 4.0 — prerequisite does not apply
+    role = "AWSControlTowerCloudTrailRole"
+    managed = "AWSControlTowerCloudTrailRolePolicy"
+    try:
+        iam = ctx.session.client("iam", region_name=ctx.region)
+        attached = iam.list_attached_role_policies(RoleName=role).get("AttachedPolicies", [])
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+            return  # a missing role is reported by check_required_iam_roles
+        report.add(Finding("cloudtrail_role_v4", UNKNOWN,
+                           f"Could not read attached policies on {role}", str(e)))
+        return
+    except BotoCoreError as e:
+        report.add(Finding("cloudtrail_role_v4", UNKNOWN,
+                           f"Could not read attached policies on {role}", str(e)))
+        return
+    if managed in {p.get("PolicyName") for p in attached}:
+        report.add(Finding("cloudtrail_role_v4", PASS,
+                           f"{role} uses the managed policy {managed} "
+                           "(landing zone v4.0 upgrade prerequisite met)"))
+    else:
+        report.add(Finding("cloudtrail_role_v4", WARNING,
+                           f"{role} does not have the {managed} managed policy attached",
+                           "Updating the landing zone to v4.0 via the API requires "
+                           f"{role} to use the AWS managed policy {managed} instead of the legacy "
+                           "inline policy. Attach the managed policy (and remove the legacy inline "
+                           "policy) before starting the update.",
+                           remediation=f"Attach the AWS managed policy {managed} to {role}, then "
+                                       "detach the legacy inline policy."))
 
 
 def check_kms_key(ctx: Context, report: Report) -> None:
@@ -1609,6 +1690,7 @@ CHECKS = [
     check_trusted_access,
     check_delegated_admins,
     check_required_iam_roles,
+    check_cloudtrail_role_v4_policy,
     check_member_execution_roles,
     check_kms_key,
     check_kms_key_policy,

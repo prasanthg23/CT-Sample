@@ -761,5 +761,76 @@ class TestColorRendering(unittest.TestCase):
                 self.assertTrue(ct._supports_color("auto"))
 
 
+class TestVersionAwareIamChecks(unittest.TestCase):
+    """Landing-zone-version-aware IAM checks (release-notes: LZ 4.0 / v4 migration guide)."""
+
+    def _iam(self, missing=None, attached=None):
+        missing = set(missing or [])
+
+        def get_role(**kw):
+            if kw["RoleName"] in missing:
+                raise client_error("NoSuchEntity", "GetRole")
+            return {"Role": {"RoleName": kw["RoleName"]}}
+
+        return FakeClient(responses={
+            "get_role": get_role,
+            "list_attached_role_policies": {
+                "AttachedPolicies": [{"PolicyName": p} for p in (attached or [])]},
+        })
+
+    # ---- #1: org Config aggregator role is version-gated ----
+    def test_aggregator_role_not_required_on_v4(self):
+        # On LZ 4.0 the aggregator is service-linked; the legacy role's absence must NOT block.
+        ctx = make_ctx(clients={"iam": self._iam(missing={ct._CONFIG_AGGREGATOR_ROLE})},
+                       lz={"version": "4.0", "latestAvailableVersion": "4.0"})
+        lv = levels(_run(ct.check_required_iam_roles, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_aggregator_role_required_on_v3(self):
+        ctx = make_ctx(clients={"iam": self._iam(missing={ct._CONFIG_AGGREGATOR_ROLE})},
+                       lz={"version": "3.2", "latestAvailableVersion": "4.0"})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_required_iam_roles, ctx)))
+
+    def test_core_role_missing_blocks_on_v4(self):
+        # Core roles are still required on every version.
+        ctx = make_ctx(clients={"iam": self._iam(missing={"AWSControlTowerAdmin"})},
+                       lz={"version": "4.0", "latestAvailableVersion": "4.0"})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_required_iam_roles, ctx)))
+
+    def test_all_roles_present_pass_on_v3(self):
+        ctx = make_ctx(clients={"iam": self._iam(missing=set())},
+                       lz={"version": "3.2", "latestAvailableVersion": "4.0"})
+        self.assertIn(ct.PASS, levels(_run(ct.check_required_iam_roles, ctx)))
+
+    # ---- #3: v4 CloudTrail-role managed-policy prerequisite ----
+    def test_cloudtrail_v4_warns_when_inline_only(self):
+        ctx = make_ctx(clients={"iam": self._iam(attached=[])},
+                       lz={"version": "3.2", "latestAvailableVersion": "4.0"})
+        self.assertIn(ct.WARNING, levels(_run(ct.check_cloudtrail_role_v4_policy, ctx)))
+
+    def test_cloudtrail_v4_pass_when_managed_attached(self):
+        ctx = make_ctx(
+            clients={"iam": self._iam(attached=["AWSControlTowerCloudTrailRolePolicy"])},
+            lz={"version": "3.2", "latestAvailableVersion": "4.0"})
+        self.assertIn(ct.PASS, levels(_run(ct.check_cloudtrail_role_v4_policy, ctx)))
+
+    def test_cloudtrail_v4_skipped_when_no_v4_upgrade(self):
+        ctx = make_ctx(clients={"iam": self._iam(attached=[])},
+                       lz={"version": "3.2", "latestAvailableVersion": "3.3"})
+        self.assertEqual(len(_run(ct.check_cloudtrail_role_v4_policy, ctx).findings), 0)
+
+    def test_cloudtrail_v4_skipped_when_already_v4(self):
+        ctx = make_ctx(clients={"iam": self._iam(attached=[])},
+                       lz={"version": "4.0", "latestAvailableVersion": "4.0"})
+        self.assertEqual(len(_run(ct.check_cloudtrail_role_v4_policy, ctx).findings), 0)
+
+    def test_version_helpers(self):
+        ctx = make_ctx(lz={"version": "4.0", "latestAvailableVersion": "3.3"})
+        self.assertEqual(ct._lz_major_version(ctx), 4)
+        self.assertEqual(ct._latest_major_version(ctx), 3)
+        self.assertIsNone(ct._lz_major_version(make_ctx(lz={"version": None})))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

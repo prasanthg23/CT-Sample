@@ -76,7 +76,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 10 | Customizations | CfCT / AFT / custom StackSets targeting governed Regions | `cloudformation` / `organizations` | INFO |
 | 11 | Trusted access | Required Organizations trusted service access disabled | `organizations:ListAWSServiceAccessForOrganization` | BLOCKER |
 | 12 | Delegated administrators | Conflicting delegated admins (CFN StackSets / Config) | `organizations:ListDelegatedAdministrators` / `ListDelegatedServicesForAccount` | INFO |
-| 13 | Required IAM roles | Missing CT management-account service roles | `iam:GetRole` | BLOCKER |
+| 13 | Required IAM roles | Missing core CT management-account service roles (all versions); the org Config aggregator role only on LZ < 4.0; and — when a 4.0+ upgrade is available — whether `AWSControlTowerCloudTrailRole` has the `AWSControlTowerCloudTrailRolePolicy` managed policy (a v4.0 prerequisite) | `iam:GetRole`, `iam:ListAttachedRolePolicies` | BLOCKER (missing role) / WARNING (v4 CloudTrail policy) |
 | 14 | KMS key state | LZ customer-managed key disabled / pending deletion | `kms:DescribeKey` | BLOCKER |
 | 15 | STS regional activation | STS deactivated in a governed Region (update fails midway) | `sts:GetCallerIdentity` (per Region) | BLOCKER |
 | 16 | SCP headroom | Target at/near the 10-SCP limit + custom SCP inventory | `organizations:ListPoliciesForTarget` | WARNING |
@@ -101,9 +101,18 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 > `--detect-drift`, active drift detection owns `DRIFTED` reporting and the stored-status check
 > defers to it (no double-counting).
 
-The required CT management-account IAM roles verified by check #13 are:
-`AWSControlTowerAdmin`, `AWSControlTowerCloudTrailRole`, `AWSControlTowerStackSetRole`,
-`AWSControlTowerConfigAggregatorRoleForOrganizations`.
+The core CT management-account IAM roles verified by check #13 are required on **every** landing
+zone version: `AWSControlTowerAdmin`, `AWSControlTowerCloudTrailRole`, and
+`AWSControlTowerStackSetRole`. The organization AWS Config aggregator role
+`AWSControlTowerConfigAggregatorRoleForOrganizations` is required **only on landing zone versions
+below 4.0** — in 4.0+ the AWS Config integration is optional and the aggregator is service-linked,
+so its absence is expected and is **not** treated as a blocker (see the [v4 Config updates](https://docs.aws.amazon.com/controltower/latest/userguide/config-updates-v4.html)).
+
+Additionally, when an upgrade to landing zone **4.0+** is available (deployed version below 4.0),
+the tool verifies that `AWSControlTowerCloudTrailRole` uses the AWS managed policy
+`AWSControlTowerCloudTrailRolePolicy` rather than the legacy inline policy — a documented 4.0
+upgrade prerequisite ([key changes for v4](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html)).
+If it does not, the tool emits a WARNING (not a blocker).
 
 ## Prerequisites
 
@@ -140,6 +149,7 @@ The required CT management-account IAM roles verified by check #13 are:
         "cloudformation:DescribeStackSetOperation",
         "cloudformation:DescribeStackResourceDrifts",
         "iam:GetRole",
+        "iam:ListAttachedRolePolicies",
         "kms:DescribeKey",
         "kms:GetKeyPolicy",
         "sts:GetCallerIdentity",
