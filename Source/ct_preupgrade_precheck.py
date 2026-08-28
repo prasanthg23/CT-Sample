@@ -353,8 +353,10 @@ def check_lz_drift(ctx: Context, report: Report) -> None:
     elif drift == "DRIFTED":
         report.add(Finding("lz_drift", BLOCKER,
                            "Landing zone is DRIFTED (out-of-band change detected)",
-                           "Landing-zone level drift (e.g. a managed SCP was attached, "
-                           "detached, deleted or modified, or a shared account was moved).",
+                           "Landing-zone level drift as reported by GetLandingZone (driftStatus): a "
+                           "managed resource was modified/deleted or a shared account was moved. "
+                           "(Since Aug 2025, an SCP merely attached to a managed OU or member "
+                           "account is no longer counted as drift.)",
                            remediation=f"Reset or update the landing zone to restore config. "
                                        f"See {DOC}/drift.html"))
     else:
@@ -768,8 +770,11 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
 
 
 def check_config_in_shared_accounts(ctx: Context, report: Report) -> None:
-    """AWS Config resources must NOT exist in Audit/Log Archive accounts, and no default
-    recorder should linger in non-home governed regions -> both block the update."""
+    """Flag extra/foreign AWS Config recorders in the Audit/Log Archive shared accounts (more than
+    the single Control Tower-managed recorder), which can block a landing-zone update. On landing
+    zone 4.0+ the AWS Config integration is optional and may use a dedicated Config account, so a
+    recorder's absence is not itself a problem — this check only warns on EXTRA recorders, and
+    otherwise degrades to UNKNOWN when the shared accounts cannot be resolved/assumed."""
     targets = []
     if ctx.audit_account:
         targets.append(("Audit", ctx.audit_account))
@@ -1322,24 +1327,31 @@ def check_expected_stacksets(ctx: Context, report: Report) -> None:
         return
     missing = [e for e in _EXPECTED_STACKSETS if e not in present]
     if missing:
-        report.add(Finding("expected_stacksets", WARNING,
+        major = _lz_major_version(ctx)
+        # On landing zone 4.0+ the SecurityRoles integration is optional; if it is disabled, these
+        # role StackSets are legitimately absent. Downgrade to INFO there (confirm the integration
+        # is intended to be off) rather than warning about a "broken" landing zone.
+        v4 = major is not None and major >= 4
+        detail = ("These core StackSets are expected in a Control Tower landing zone; their absence "
+                  "can indicate the landing zone is broken or was partially deleted. All "
+                  "landing-zone operations (Update/upgrade, Reset, Repair, and the console Retry on "
+                  "a failed dashboard) run the same UpdateLandingZone backend workflow, which "
+                  "re-creates these baseline StackSets.")
+        if v4:
+            detail += (" NOTE: on landing zone 4.0+ the SecurityRoles integration is optional — if it "
+                       "is disabled these role StackSets are expected to be absent (not a problem). "
+                       "Confirm whether SecurityRoles is intentionally disabled.")
+        report.add(Finding("expected_stacksets", INFO if v4 else WARNING,
                            f"{len(missing)} foundational AWSControlTower StackSet(s) appear missing",
-                           "These core StackSets are expected in every Control Tower landing zone; "
-                           "their absence indicates the landing zone is broken or was partially "
-                           "deleted. All landing-zone operations (Update/upgrade, Reset, Repair, and "
-                           "the console Retry on a failed dashboard) run the same UpdateLandingZone "
-                           "backend workflow, which re-creates these baseline StackSets — so a normal "
-                           "version upgrade would also attempt to re-create them. Treat this as a "
-                           "broken landing zone to repair, not a routine upgrade. (Heuristic: only "
-                           "version-stable StackSets are asserted; if the landing zone is also "
-                           "FAILED, see the landing-zone status blocker.)",
+                           detail,
                            cols=["Missing StackSet"], rows=[[m] for m in missing],
                            remediation="Retry/resolve the failed landing-zone operation to re-create "
                                        "the missing StackSets (all landing-zone operations run the "
-                                       "same UpdateLandingZone workflow). AWS Control Tower does not "
-                                       "roll back a failed update and can leave the landing zone in an "
-                                       "indeterminate state — if retrying does not resolve it, contact "
-                                       "AWS Support."))
+                                       "same UpdateLandingZone workflow). On 4.0+ first confirm the "
+                                       "SecurityRoles integration is meant to be enabled. AWS Control "
+                                       "Tower does not roll back a failed update and can leave the "
+                                       "landing zone in an indeterminate state — if retrying does not "
+                                       "resolve it, contact AWS Support."))
     else:
         report.add(Finding("expected_stacksets", PASS,
                            f"Foundational AWSControlTower StackSets are present "

@@ -377,6 +377,18 @@ class TestBlockerPaths(unittest.TestCase):
         ctx = make_ctx({"cloudformation": cfn})
         self.assertIn(ct.PASS, levels(_run(ct.check_expected_stacksets, ctx)))
 
+    def test_expected_stacksets_missing_is_info_on_v4(self):
+        # On LZ 4.0+ the SecurityRoles integration is optional, so missing role StackSets are
+        # downgraded from WARNING to INFO (not a "broken landing zone").
+        cfn = FakeClient({"list_stack_sets": {"Summaries": [
+            {"StackSetName": "AWSControlTowerExecutionRole"}]}})  # baseline roles missing
+        ctx = make_ctx({"cloudformation": cfn},
+                       lz={"version": "4.0", "latestAvailableVersion": "4.0"})
+        lv = levels(_run(ct.check_expected_stacksets, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
     # 8d. In-progress StackSet operations --------------------------------------------
     def test_stackset_ops_in_progress_blocks(self):
         cfn = FakeClient({
