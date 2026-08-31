@@ -157,6 +157,7 @@ _CHECK_DOCS = {
     "lz_status": f"{DOC}/troubleshooting.html",
     "lz_drift": f"{DOC}/drift.html",
     "update_available": f"{DOC}/lz-version-selection.html",
+    "upgrade_considerations": f"{DOC}/update-controltower.html",
     "managed_accounts": f"{DOC}/account-factory-considerations.html",
     "closed_with_pp": f"{DOC}/troubleshooting.html",
     "controls_drift": f"{DOC}/resolving-drift.html",
@@ -383,6 +384,145 @@ def check_update_available(ctx: Context, report: Report) -> None:
                            cols=["Current", "Latest"], rows=[[str(cur), str(latest)]],
                            remediation=f"Review {DOC}/lz-update-best-practices.html "
                                        "(2.x -> 3.x requires OU re-registration)."))
+
+
+# --------------------------------------------------------------------------------------
+# Version-path upgrade considerations (advisory checklist)
+#
+# For each landing zone version that requires an update, this catalogs the notable changes,
+# risks, and known issues introduced AT that version — so that upgrading across a range
+# (e.g. 2.9 -> 4.0) surfaces every boundary crossed. Each (change, action) pair and its doc
+# URL is taken verbatim from the AWS Control Tower release notes / v4 migration docs (no
+# guessed content). Surfaced as INFO findings in a normal run, or standalone via
+# `--upgrade-notes CURRENT:LATEST` (no AWS calls needed — pure knowledge output).
+# --------------------------------------------------------------------------------------
+_VERSION_CONSIDERATIONS = [
+    ("3.0", f"{DOC}/2022-all.html", [
+        ("Organization-level CloudTrail replaces account-level trails",
+         "On update to 3.0, Control Tower deletes the existing account-level trails for ENROLLED "
+         "accounts after a 24-hour wait. If you rely on account-level trails, create your own "
+         "BEFORE updating. A failure after the org trail is created can incur duplicate "
+         "org+account trail charges until the update completes."),
+        ("CloudTrail S3 log path changes",
+         "Org-trail logs are stored under /org-id/AWSLogs/org-id/... (a different path than "
+         "account-trail logs). If a third-party service consumes these logs, give it the new path."),
+        ("AWS Config records global resources in the home Region only",
+         "The Config baseline changes to record global resources only in the home Region."),
+        ("Region deny control and AWSControlTowerServiceRolePolicy updated",
+         "The Region deny control and the managed AWSControlTowerServiceRolePolicy are updated."),
+        ("Per-account aws-controltower-CloudWatchLogsRole / log group no longer created",
+         "With org trails, only one is created in the management account; the per-account role "
+         "and log group are no longer created in each enrolled account."),
+    ]),
+    ("3.1", f"{DOC}/2023-all.html", [
+        ("Server access logging deactivated on the access-logging bucket",
+         "Control Tower stops access logging on the Log Archive access-logging bucket. This "
+         "triggers Security Hub finding [S3.9] on that bucket - suppress it per Security Hub guidance."),
+        ("Region deny control expanded for more global services",
+         "Adds actions for account, activate, artifact, billingconductor, compute-optimizer, "
+         "devicefarm, license-manager, lightsail, resource-explorer-2, savingsplans, sso, "
+         "supportapp, supportplans, sustainability, tag, and more. Re-review custom Region-deny edits."),
+    ]),
+    ("3.2", f"{DOC}/2023-all.html", [
+        ("New service-linked role AWSServiceRoleForAWSControlTower + EventBridge managed rule",
+         "Control Tower creates the SLR and deploys AWSControlTowerManagedRule directly (not via a "
+         "stack) in each member account to collect Security Hub Finding events for drift. A new "
+         "management-account StackSet BP_BASELINE_SERVICE_LINKED_ROLE deploys the SLR."),
+        ("Security Hub CSPM Service-Managed Standard generally available + drift status",
+         "Control drift for this standard becomes viewable; Finding events are sent to the home Region only."),
+        ("Region deny control updated",
+         "Adds billing, cloudtrail:LookupEvents, consolidatedbilling, consoleapp, freetier, "
+         "invoicing, iq, notifications(-contacts), payments, tax; removes invalid "
+         "s3:GetAccountPublic / s3:PutAccountPublic."),
+    ]),
+    ("3.3", f"{DOC}/2023-all.html", [
+        ("Audit-account S3 bucket policy now requires aws:SourceOrgID on writes",
+         "CloudTrail can write logs only for accounts within your organization. Any external / "
+         "cross-org writer to this bucket will be denied after the update."),
+        ("AWS Config SNS topic policy adds aws:SourceOrgID condition",
+         "Review any external subscribers/publishers to the Config SNS topic."),
+        ("Region deny control updated",
+         "Removes discovery-marketplace (covered by aws-marketplace:*); adds "
+         "quicksight:DescribeAccountSubscription."),
+        ("BASELINE-CLOUDTRAIL-MASTER template updated to not show drift without KMS",
+         "If you did not enable KMS encryption for CloudTrail, this removes a spurious drift signal."),
+    ]),
+    ("4.0", f"{DOC}/key-changes-lz-v4.html", [
+        ("PREREQUISITE (API upgrade): AWSControlTowerCloudTrailRole must use the managed policy",
+         "Before upgrading to 4.0 via API, detach the legacy inline policy and attach managed policy "
+         "AWSControlTowerCloudTrailRolePolicy, or the upgrade is blocked. (This tool's "
+         "cloudtrail_role_v4 check verifies this.)"),
+        ("Do NOT disable service integrations (AWS Config, SecurityRoles) during the upgrade",
+         "Config and SecurityRoles were always implicit in 3.3 and earlier; 4.0 surfaces them as "
+         "configurable options. Leave them enabled while upgrading - disable them only AFTER a "
+         "successful upgrade to 4.0."),
+        ("Security OU is no longer created or enforced by Control Tower",
+         "4.0 does not create the designated Security OU; the OU containing your service-integration "
+         "accounts becomes the Security OU. Existing Security OU setups keep working. That OU shows a "
+         "baseline status of 'Not Applicable' (expected). Moving member accounts into it drifts "
+         "enabled controls on that OU."),
+        ("All integrations become optional, with baseline enable/disable dependencies",
+         "Config, CloudTrail, SecurityRoles, and Backup can each be enabled/disabled. Baselines depend "
+         "on one another - e.g. CentralSecurityRolesBaseline requires CentralConfigBaseline; "
+         "IdentityCenter/Backup baselines require CentralSecurityRolesBaseline. Disable order is the "
+         "reverse. Plan toggles accordingly."),
+        ("AWS Config integration scope changed",
+         "Enabling Config at the landing-zone level deploys recording to service-integration accounts "
+         "only. To deploy Config (recorder + delivery channel) to member accounts, enable the Config "
+         "baseline on each managed OU. LZ-level Config is a prerequisite for the OU Config baseline."),
+        ("Drift notifications move to Amazon EventBridge",
+         "For 4.0 landing zones without AWSControlTowerBaseline enabled, Control Tower stops sending "
+         "drift notifications to the SNS topic and sends them to EventBridge in the management account. "
+         "Update any consumers that watched the SNS topic."),
+        ("CentralizedLogging disable now DELETES logging-account resources",
+         "In 3.3 and earlier, disabling CentralizedLogging toggled the org CloudTrail off but kept "
+         "resources. In 4.0, disabling it deletes the Config Recorder, Delivery Channel, and "
+         "CloudTrail stack instances from the logging account, and Control Tower stops managing that "
+         "account. (Relevant if you disable it post-upgrade.)"),
+    ]),
+]
+
+
+def _ver_tuple(v) -> Optional[tuple]:
+    """('3.2') -> (3, 2). None if unparseable. Compares correctly across 2.9 < 3.0 < ... < 4.0."""
+    try:
+        parts = str(v).split(".")
+        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def upgrade_path_considerations(cur, latest):
+    """Return [(version, doc, rows)] for every catalogued version strictly above `cur`
+    and up to and including `latest`. Unknown bound => that side is not filtered."""
+    ct, lt = _ver_tuple(cur), _ver_tuple(latest)
+    out = []
+    for ver, doc, rows in _VERSION_CONSIDERATIONS:
+        vt = _ver_tuple(ver)
+        if vt is None:
+            continue
+        if (ct is None or vt > ct) and (lt is None or vt <= lt):
+            out.append((ver, doc, rows))
+    return out
+
+
+def check_upgrade_path_considerations(ctx: Context, report: Report) -> None:
+    """Advisory: surface the notable changes/risks introduced at each landing zone version
+    crossed on the way from the deployed version to the latest available version."""
+    cur = ctx.lz.get("version")
+    latest = ctx.lz.get("latestAvailableVersion")
+    if not cur or not latest or cur == latest:
+        return
+    for ver, doc, rows in upgrade_path_considerations(cur, latest):
+        report.add(Finding(
+            "upgrade_considerations", INFO,
+            f"Upgrade-path considerations for landing zone v{ver}",
+            detail=f"Changes introduced at v{ver} on the path {cur} -> {latest}. "
+                   "Advisory (not a blocker) — review before upgrading.",
+            cols=["Change / consideration", "What it means / action"],
+            rows=[[c, a] for c, a in rows],
+            doc=doc,
+        ))
 
 
 def check_managed_accounts(ctx: Context, report: Report) -> None:
@@ -1687,6 +1827,7 @@ CHECKS = [
     check_lz_status,
     check_lz_drift,
     check_update_available,
+    check_upgrade_path_considerations,
     check_managed_accounts,
     check_suspended_with_provisioned_product,
     check_provisioned_product_health,
@@ -1796,6 +1937,34 @@ def render_text(report: Report, ctx: Context, use_color: bool = False) -> str:
     return "\n".join(lines)
 
 
+def render_upgrade_notes(cur: str, latest: str, use_color: bool = False) -> str:
+    """Standalone advisory checklist for a version path (no AWS calls). Answers
+    'what should I know / watch for upgrading from vX to vY?'."""
+    items = upgrade_path_considerations(cur, latest)
+    lines = ["=" * 78]
+    title = f"AWS Control Tower — Upgrade-Path Considerations: v{cur} -> v{latest}"
+    lines.append((_BOLD + title + _RESET) if use_color else title)
+    lines.append("=" * 78)
+    if not items:
+        lines.append(f"No catalogued version-boundary changes between v{cur} and v{latest}.")
+        lines.append("(This checklist covers landing zone versions 3.0, 3.1, 3.2, 3.3, and 4.0. "
+                     "Confirm cur/latest are landing zone versions, e.g. 2.9:4.0.)")
+        lines.append("=" * 78)
+        return "\n".join(lines)
+    for ver, doc, rows in items:
+        lines.append("\n" + _c(f"[ v{ver} ]", INFO, use_color, bold=True))
+        lines.append("-" * 78)
+        for change, action in rows:
+            lines.append("  - " + (_c(change, INFO, use_color)))
+            lines.append(f"      {action}")
+        lines.append(f"  DOC: {doc}")
+    lines.append("\n" + "=" * 78)
+    lines.append(f"{len(items)} version boundary(ies) crossed. Advisory checklist — verify against "
+                 "the linked release notes before upgrading.")
+    lines.append("=" * 78)
+    return "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Control Tower pre-upgrade precheck (read-only)")
     ap.add_argument("--region", help="Home region (defaults to session region)")
@@ -1824,9 +1993,20 @@ def main() -> int:
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="Colorize the text report: auto (TTY only, default), always, or never "
                          "(also honors the NO_COLOR environment variable)")
+    ap.add_argument("--upgrade-notes", metavar="CURRENT:LATEST",
+                    help="Print the doc-cited upgrade-path considerations checklist for a version "
+                         "path (e.g. 2.9:4.0) and exit. Requires no AWS access.")
     args = ap.parse_args()
 
     use_color = _supports_color(args.color)
+
+    if args.upgrade_notes:
+        parts = args.upgrade_notes.split(":", 1)
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            print("Use --upgrade-notes CURRENT:LATEST, e.g. 2.9:4.0", file=sys.stderr)
+            return 3
+        print(render_upgrade_notes(parts[0].strip(), parts[1].strip(), use_color))
+        return 0
 
     session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
     region = args.region or session.region_name

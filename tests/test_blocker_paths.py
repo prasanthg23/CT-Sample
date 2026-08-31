@@ -844,5 +844,72 @@ class TestVersionAwareIamChecks(unittest.TestCase):
         self.assertIsNone(ct._lz_major_version(make_ctx(lz={"version": None})))
 
 
+class TestUpgradePathConsiderations(unittest.TestCase):
+    """Version-path upgrade-considerations catalog + advisory check."""
+
+    def test_full_path_crosses_all_five_boundaries(self):
+        vers = [v for v, _doc, _rows in ct.upgrade_path_considerations("2.9", "4.0")]
+        self.assertEqual(vers, ["3.0", "3.1", "3.2", "3.3", "4.0"])
+
+    def test_partial_path_only_includes_crossed_boundaries(self):
+        vers = [v for v, _d, _r in ct.upgrade_path_considerations("3.3", "4.0")]
+        self.assertEqual(vers, ["4.0"])
+
+    def test_same_version_yields_no_considerations(self):
+        self.assertEqual(ct.upgrade_path_considerations("4.0", "4.0"), [])
+
+    def test_mid_range_excludes_below_and_above(self):
+        vers = [v for v, _d, _r in ct.upgrade_path_considerations("3.1", "3.3")]
+        self.assertEqual(vers, ["3.2", "3.3"])  # 3.0/3.1 below current, 4.0 above latest
+
+    def test_version_tuple_orders_2_9_below_3_0(self):
+        self.assertLess(ct._ver_tuple("2.9"), ct._ver_tuple("3.0"))
+        self.assertEqual(ct._ver_tuple("4.0"), (4, 0))
+        self.assertIsNone(ct._ver_tuple(None))
+
+    def test_every_catalog_entry_is_doc_cited_and_well_formed(self):
+        for ver, doc, rows in ct._VERSION_CONSIDERATIONS:
+            self.assertTrue(doc.startswith(ct.DOC), f"{ver} doc not a CT userguide URL: {doc}")
+            self.assertTrue(rows, f"{ver} has no considerations")
+            for row in rows:
+                self.assertEqual(len(row), 2, f"{ver} row must be (change, action): {row}")
+                self.assertTrue(row[0] and row[1], f"{ver} has an empty cell")
+
+    def test_v4_cloudtrail_managed_policy_prerequisite_present(self):
+        rows = dict((v, rows) for v, _d, rows in ct._VERSION_CONSIDERATIONS)["4.0"]
+        blob = " ".join(c + " " + a for c, a in rows)
+        self.assertIn("AWSControlTowerCloudTrailRolePolicy", blob)
+        self.assertIn("Do NOT disable service integrations", blob)
+
+    def test_check_emits_info_findings_on_update_path(self):
+        ctx = make_ctx(lz={"status": "ACTIVE", "version": "2.9", "latestAvailableVersion": "4.0"})
+        rpt = _run(ct.check_upgrade_path_considerations, ctx)
+        ups = [f for f in rpt.findings if f.check == "upgrade_considerations"]
+        self.assertEqual(len(ups), 5)
+        self.assertTrue(all(f.level == ct.INFO for f in ups))
+        self.assertTrue(all(f.doc.startswith(ct.DOC) for f in ups))
+
+    def test_check_silent_when_already_latest(self):
+        ctx = make_ctx(lz={"status": "ACTIVE", "version": "4.0", "latestAvailableVersion": "4.0"})
+        rpt = _run(ct.check_upgrade_path_considerations, ctx)
+        self.assertEqual([f for f in rpt.findings if f.check == "upgrade_considerations"], [])
+
+    def test_check_silent_when_latest_unknown(self):
+        ctx = make_ctx(lz={"status": "ACTIVE", "version": "3.3", "latestAvailableVersion": None})
+        rpt = _run(ct.check_upgrade_path_considerations, ctx)
+        self.assertEqual([f for f in rpt.findings if f.check == "upgrade_considerations"], [])
+
+    def test_render_upgrade_notes_scopes_to_path(self):
+        out = ct.render_upgrade_notes("3.2", "4.0")
+        self.assertIn("[ v3.3 ]", out)
+        self.assertIn("[ v4.0 ]", out)
+        self.assertNotIn("[ v3.0 ]", out)
+        self.assertIn("DOC:", out)
+
+    def test_render_upgrade_notes_empty_path_is_graceful(self):
+        out = ct.render_upgrade_notes("4.0", "4.0")
+        self.assertIn("No catalogued version-boundary changes", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
