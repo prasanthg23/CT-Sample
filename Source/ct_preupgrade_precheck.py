@@ -108,7 +108,7 @@ except ImportError:
 BLOCKER = "BLOCKER"   # must fix before upgrade; gates the run
 WARNING = "WARNING"   # should review; may cause partial issues
 INFO = "INFO"         # informational (e.g. customizations you must be aware of)
-PASS = "PASS"         # verified good
+PASS = "PASS"         # verified good  # nosec B105 - severity-level label, not a password
 UNKNOWN = "UNKNOWN"   # could not verify (missing perms / API error) — never assume good
 
 

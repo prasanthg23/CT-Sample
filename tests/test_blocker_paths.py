@@ -63,8 +63,8 @@ class FakeClient:
 
 class _Creds:
     access_key = "AK"
-    secret_key = "SK"
-    token = "TK"
+    secret_key = "SK"  # nosec B105 - fake test credential, not a real secret
+    token = "TK"  # nosec B105 - fake test credential, not a real secret
 
     def get_frozen_credentials(self):
         return self
