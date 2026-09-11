@@ -911,5 +911,124 @@ class TestUpgradePathConsiderations(unittest.TestCase):
         self.assertIn("No catalogued version-boundary changes", out)
 
 
+class TestV4IntegrationAccountsSameOu(unittest.TestCase):
+    """LZ 4.0 requires every service-integration account to share one parent OU."""
+
+    LOG = "111111111111"
+    SEC = "222222222222"
+    CFG = "333333333333"
+    OU_A = [{"Id": "ou-aaaa", "Type": "ORGANIZATIONAL_UNIT"}]
+    OU_B = [{"Id": "ou-bbbb", "Type": "ORGANIZATIONAL_UNIT"}]
+
+    def _manifest(self, **extra):
+        m = {"centralizedLogging": {"accountId": self.LOG, "enabled": True},
+             "securityRoles": {"accountId": self.SEC, "enabled": True}}
+        m.update(extra)
+        return m
+
+    def _ctx(self, parents, manifest=None, lz=None):
+        """parents maps accountId -> Parents list, or an Exception to raise for it."""
+        def list_parents(**kwargs):
+            v = parents[kwargs["ChildId"]]
+            if isinstance(v, Exception):
+                raise v
+            return {"Parents": v}
+        orgs = FakeClient(responses={"list_parents": list_parents})
+        return make_ctx({"organizations": orgs},
+                        manifest=self._manifest() if manifest is None else manifest,
+                        lz=lz or {"status": "ACTIVE", "version": "3.3",
+                                  "latestAvailableVersion": "4.0",
+                                  "driftStatus": {"status": "IN_SYNC"}})
+
+    def _run(self, ctx):
+        rep = ct.Report()
+        ct.check_v4_integration_accounts_same_ou(ctx, rep)
+        return rep.findings
+
+    def test_same_parent_ou_passes(self):
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: self.OU_A}))
+        self.assertEqual([x.level for x in f], [ct.PASS])
+        self.assertIn("share one parent OU", f[0].summary)
+
+    def test_split_across_ous_warns(self):
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: self.OU_B}))
+        self.assertEqual([x.level for x in f], [ct.WARNING])
+        self.assertIn("2 different parent", f[0].summary)
+        self.assertEqual(len(f[0].rows), 2)
+
+    def test_disabled_integration_is_skipped(self):
+        # 4.0 manifest with SecurityRoles/Config/Backup off: only logging names an account.
+        m = {"centralizedLogging": {"accountId": self.LOG, "enabled": True},
+             "securityRoles": {"enabled": False},
+             "config": {"enabled": False},
+             "backup": {"enabled": False}}
+        f = self._run(self._ctx({self.LOG: self.OU_A}, manifest=m))
+        self.assertEqual([x.level for x in f], [ct.PASS])
+        self.assertIn("not applicable", f[0].summary)
+
+    def test_config_account_is_included(self):
+        m = self._manifest(config={"accountId": self.CFG, "enabled": True})
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: self.OU_A,
+                                 self.CFG: self.OU_A}, manifest=m))
+        self.assertEqual([x.level for x in f], [ct.PASS])
+        self.assertIn("3 service-integration", f[0].summary)
+
+    def test_denied_list_parents_is_unknown_not_pass(self):
+        """Fail-safe: an unreadable parent must not be dropped into a PASS."""
+        denied = ct.ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "ListParents")
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: denied}))
+        levels = [x.level for x in f]
+        self.assertIn(ct.UNKNOWN, levels)
+        self.assertNotIn(ct.PASS, levels)
+
+    def test_denied_still_reports_a_split_it_can_see(self):
+        denied = ct.ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "ListParents")
+        m = self._manifest(config={"accountId": self.CFG, "enabled": True})
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: self.OU_B,
+                                 self.CFG: denied}, manifest=m))
+        levels = [x.level for x in f]
+        self.assertIn(ct.UNKNOWN, levels)
+        self.assertIn(ct.WARNING, levels)
+
+    def test_not_evaluated_when_v4_not_available(self):
+        ctx = self._ctx({self.LOG: self.OU_A, self.SEC: self.OU_A},
+                        lz={"status": "ACTIVE", "version": "3.2",
+                            "latestAvailableVersion": "3.3",
+                            "driftStatus": {"status": "IN_SYNC"}})
+        self.assertEqual(self._run(ctx), [])
+
+    def test_empty_parents_list_is_unknown(self):
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: []}))
+        levels = [x.level for x in f]
+        self.assertIn(ct.UNKNOWN, levels)
+        self.assertNotIn(ct.PASS, levels)
+
+
+    def test_shared_account_counts_once(self):
+        """Config and CentralizedLogging on one account is a single account, not two."""
+        m = self._manifest(config={"accountId": self.LOG, "enabled": True})
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: self.OU_A}, manifest=m))
+        self.assertEqual([x.level for x in f], [ct.PASS])
+        self.assertIn("2 service-integration", f[0].summary)
+
+    def test_shared_account_shows_every_integration_label(self):
+        m = self._manifest(config={"accountId": self.LOG, "enabled": True})
+        f = self._run(self._ctx({self.LOG: self.OU_A, self.SEC: self.OU_B}, manifest=m))
+        self.assertEqual([x.level for x in f], [ct.WARNING])
+        labels = " ".join(str(r[0]) for r in f[0].rows)
+        self.assertIn("CentralizedLogging", labels)
+        self.assertIn("Config", labels)
+
+    def test_all_integrations_on_one_account_is_not_applicable(self):
+        m = {"centralizedLogging": {"accountId": self.LOG, "enabled": True},
+             "config": {"accountId": self.LOG, "enabled": True},
+             "securityRoles": {"enabled": False}}
+        f = self._run(self._ctx({self.LOG: self.OU_A}, manifest=m))
+        self.assertEqual([x.level for x in f], [ct.PASS])
+        self.assertIn("not applicable", f[0].summary)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

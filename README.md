@@ -132,6 +132,7 @@ If it does not, the tool emits a WARNING (not a blocker).
         "controltower:ListEnabledBaselines",
         "organizations:ListRoots",
         "organizations:ListOrganizationalUnitsForParent",
+        "organizations:ListParents",
         "organizations:ListAccounts",
         "organizations:ListPolicies",
         "organizations:ListPoliciesForTarget",

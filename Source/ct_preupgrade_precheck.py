@@ -78,6 +78,7 @@ REQUIRED PERMISSIONS (management account, read-only)
     controltower:ListLandingZones, GetLandingZone, ListEnabledControls, ListEnabledBaselines
     organizations:ListRoots, ListOrganizationalUnitsForParent,
                   ListAccounts, ListPolicies, ListPoliciesForTarget,
+                  ListParents,
                   ListAWSServiceAccessForOrganization, ListDelegatedAdministrators,
                   ListDelegatedServicesForAccount, DescribePolicy
     servicecatalog:SearchProvisionedProducts
@@ -175,6 +176,7 @@ _CHECK_DOCS = {
     "delegated_admins": f"{DOC}/governance-drift.html",
     "iam_roles": f"{DOC}/roles-how.html",
     "cloudtrail_role_v4": f"{DOC}/key-changes-lz-v4.html",
+    "v4_integration_ou": f"{DOC}/key-changes-lz-v4.html",
     "kms_key": f"{DOC}/configure-shared-accounts.html",
     "kms_policy": f"{DOC}/configure-shared-accounts.html",
     "sts_regions": f"{DOC}/troubleshooting.html",
@@ -1180,6 +1182,114 @@ def check_cloudtrail_role_v4_policy(ctx: Context, report: Report) -> None:
                                        "detach the legacy inline policy."))
 
 
+# Manifest keys that name a service-integration account, with their display labels.
+_V4_INTEGRATIONS = (
+    ("centralizedLogging", "CentralizedLogging"),
+    ("securityRoles", "SecurityRoles"),
+    ("config", "Config"),
+    ("backup", "Backup"),
+)
+
+
+def _error_code(e: Exception) -> str:
+    """Best-effort AWS error code for a botocore exception ('' if not a ClientError)."""
+    if isinstance(e, ClientError):
+        return e.response.get("Error", {}).get("Code", "") or ""
+    return type(e).__name__
+
+
+def check_v4_integration_accounts_same_ou(ctx: Context, report: Report) -> None:
+    """v4.0 requirement: every account configured for a service integration must sit under
+    the same parent OU.
+
+    Doc (key-changes-lz-v4.html): "AWS Control Tower will require all accounts that are
+    configured for each AWS service integration to be under the same parent OU." In 4.0 the
+    OU holding those accounts *becomes* the designated Security OU, so a split across OUs is
+    an unsupported layout.
+
+    Evaluated when the landing zone is already 4.0+ (live requirement) or when an upgrade into
+    4.0+ is available (upgrade prerequisite). Reported as WARNING, consistent with how
+    check_cloudtrail_role_v4_policy treats the other documented 4.0 prerequisite.
+
+    Explicitly disabled integrations are skipped: a disabled integration names no account and
+    therefore has no OU to place. Accounts whose parent cannot be read are reported as UNKNOWN
+    rather than being dropped from the comparison.
+    """
+    latest = _latest_major_version(ctx)
+    if latest is None or latest < 4:
+        return  # 4.0 is not in play for this landing zone
+
+    accounts: List[List[str]] = []
+    for key, label in _V4_INTEGRATIONS:
+        node = (ctx.manifest.get(key)
+                or ctx.manifest.get(key[:1].upper() + key[1:])
+                or {})
+        if node.get("enabled") is False:
+            continue  # explicitly disabled -> no integration account to place
+        acct = node.get("accountId") or node.get("AccountId")
+        if acct:
+            accounts.append([label, acct])
+
+    # One account can serve several integrations (Config and CentralizedLogging commonly share
+    # one), so group labels per account: what matters is how many distinct accounts there are
+    # and which OU each sits in, not how many integrations point at them.
+    by_account: Dict[str, List[str]] = {}
+    for label, acct in accounts:
+        by_account.setdefault(acct, []).append(label)
+
+    if len(by_account) < 2:
+        report.add(Finding("v4_integration_ou", PASS,
+                           "Same-parent-OU requirement not applicable "
+                           f"({len(by_account)} service-integration account(s) configured)",
+                           "Landing zone 4.0 requires all service-integration accounts to share "
+                           "one parent OU. With fewer than two such accounts there is nothing to "
+                           "compare."))
+        return
+
+    resolved: Dict[str, List[str]] = {}   # accountId -> [integrations, parentId, parentType]
+    unresolved: List[List[str]] = []
+    for acct, labels in by_account.items():
+        joined = ", ".join(labels)
+        try:
+            parents = _collect(ctx.orgs, "list_parents", "Parents", ChildId=acct)
+        except (ClientError, BotoCoreError) as e:
+            unresolved.append([joined, acct, _error_code(e) or "error"])
+            continue
+        if not parents:
+            unresolved.append([joined, acct, "no parent returned"])
+            continue
+        resolved[acct] = [joined, parents[0].get("Id", ""), parents[0].get("Type", "")]
+
+    if unresolved:
+        report.add(Finding("v4_integration_ou", UNKNOWN,
+                           f"Could not determine the parent OU of {len(unresolved)} "
+                           "service-integration account(s)",
+                           "The landing zone 4.0 same-parent-OU requirement could not be fully "
+                           "evaluated. Treat this as not checked, not as a pass.",
+                           cols=["Integration", "Account", "Error"], rows=unresolved,
+                           remediation="Grant organizations:ListParents and re-run."))
+
+    distinct = {v[1] for v in resolved.values()}
+    if len(distinct) > 1:
+        rows = [[v[0], acct, v[1], v[2]] for acct, v in sorted(resolved.items())]
+        report.add(Finding("v4_integration_ou", WARNING,
+                           f"Service-integration accounts span {len(distinct)} different parent "
+                           "OUs (landing zone 4.0 requires one)",
+                           "Landing zone 4.0 requires all accounts configured for a service "
+                           "integration to be under the same parent OU - that OU becomes the "
+                           "designated Security OU. Accounts split across OUs is an unsupported "
+                           "layout and should be reconciled before upgrading to 4.0.",
+                           cols=["Integration", "Account", "Parent", "Type"], rows=rows,
+                           remediation="Move the service-integration accounts under a single "
+                                       "parent OU before upgrading. See "
+                                       f"{DOC}/key-changes-lz-v4.html"))
+    elif resolved and not unresolved:
+        parent = next(iter(distinct))
+        report.add(Finding("v4_integration_ou", PASS,
+                           f"All {len(resolved)} service-integration account(s) share one parent "
+                           f"OU ({parent})"))
+
+
 def check_kms_key(ctx: Context, report: Report) -> None:
     """If the landing zone uses a customer-managed KMS key, it must be ENABLED (not disabled
     or pending deletion)."""
@@ -1844,6 +1954,7 @@ CHECKS = [
     check_delegated_admins,
     check_required_iam_roles,
     check_cloudtrail_role_v4_policy,
+    check_v4_integration_accounts_same_ou,
     check_member_execution_roles,
     check_kms_key,
     check_kms_key_policy,
