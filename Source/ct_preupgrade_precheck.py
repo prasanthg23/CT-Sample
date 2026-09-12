@@ -603,13 +603,19 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
                            "Could not enumerate OUs for control drift check", str(e)))
         return
     drifted, failed = [], []
+    skipped: List[List[str]] = []
     checked = 0
     for ou in ous:
         try:
             controls = _collect(ctx.ct, "list_enabled_controls", "enabledControls",
                                  targetIdentifier=ou["Arn"])
-        except (ClientError, BotoCoreError):
-            continue  # OU not registered with CT -> ListEnabledControls errors; skip
+        except (ClientError, BotoCoreError) as e:
+            # An OU with no Control Tower controls returns an empty list, not an error, so a
+            # failure here means the OU could not be READ (denied / throttled / transient) -
+            # never that it legitimately has nothing. Record it rather than silently dropping
+            # it from this check's scope.
+            skipped.append([ou.get("Name", ou.get("Arn", "")), _error_code(e), _skip_note(e)])
+            continue
         checked += 1
         for c in controls:
             ds = (c.get("driftStatusSummary") or {}).get("driftStatus")
@@ -623,6 +629,7 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
         report.add(Finding("controls_drift", UNKNOWN,
                            "No CT-registered OUs found / none queryable for enabled controls"))
         return
+    _report_partial_scope(report, "controls_drift", "OU(s)", skipped)
     if drifted or failed:
         rows = drifted + failed
         report.add(Finding("controls_drift", BLOCKER,
@@ -634,7 +641,8 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
                                        f"{DOC}/drift.html"))
     else:
         report.add(Finding("controls_drift", PASS,
-                           f"All enabled controls SUCCEEDED and IN_SYNC across {checked} OU(s)"))
+                           f"All enabled controls SUCCEEDED and IN_SYNC across {checked} OU(s)"
+                           f"{_scope_suffix(skipped)}"))
 
 
 def check_enabled_baselines(ctx: Context, report: Report) -> None:
@@ -689,10 +697,14 @@ def check_stacksets(ctx: Context, report: Report) -> None:
     shared = {a for a in (ctx.mgmt_account, ctx.audit_account, ctx.log_archive_account) if a}
 
     shared_bad, member_bad, outdated, orphaned = [], [], [], []
+    skipped: List[List[str]] = []
     for name in names:
         try:
             insts = _collect(cfn, "list_stack_instances", "Summaries", StackSetName=name)
-        except (ClientError, BotoCoreError):
+        except (ClientError, BotoCoreError) as e:
+            # This check emits only BLOCKER or PASS, so a silent skip here can turn a real
+            # blocker into a clean report. Record the StackSet as unread instead.
+            skipped.append([name, _error_code(e), _skip_note(e)])
             continue
         for i in insts:
             status = i.get("Status")  # summary status: CURRENT | OUTDATED | INOPERABLE
@@ -717,6 +729,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
             elif status == "OUTDATED":
                 # Expected when an LZ update is pending — the update refreshes these.
                 outdated.append(row)
+    _report_partial_scope(report, "stacksets", "AWSControlTower StackSet(s)", skipped)
     if shared_bad:
         report.add(Finding("stacksets", BLOCKER,
                            f"{len(shared_bad)} AWSControlTower* StackSet instance(s) inoperable/failed/"
@@ -758,7 +771,8 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                                rows=outdated[:50]))
         elif not orphaned:
             report.add(Finding("stacksets", PASS,
-                               f"All instances CURRENT across {len(names)} AWSControlTower StackSet(s)"))
+                               f"All instances CURRENT across {len(names)} AWSControlTower "
+                               f"StackSet(s){_scope_suffix(skipped)}"))
 
 
 def _resource_drift_detail(ctx: "Context", acct: str, region: str, stack_id) -> str:
@@ -850,7 +864,10 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
     for name in names:
         try:
             insts = _collect(cfn, "list_stack_instances", "Summaries", StackSetName=name)
-        except (ClientError, BotoCoreError):
+        except (ClientError, BotoCoreError) as e:
+            # Route into `failed`, which already suppresses the PASS below, so an unread
+            # StackSet cannot read as "no drift".
+            failed.append([name, "list_instances_failed", _skip_note(e)])
             continue
         for i in insts:
             if i.get("DriftStatus") != "DRIFTED":
@@ -1198,6 +1215,39 @@ def _error_code(e: Exception) -> str:
     return type(e).__name__
 
 
+def _skip_note(e: Exception) -> str:
+    """Short human-readable detail for a per-target failure."""
+    if isinstance(e, ClientError):
+        return (e.response.get("Error", {}).get("Message", "") or "")[:120]
+    return str(e)[:120]
+
+
+def _scope_suffix(skipped: List[List[str]]) -> str:
+    """Suffix for a PASS summary when part of the check's scope could not be read."""
+    return f" ({len(skipped)} target(s) skipped - see UNKNOWN)" if skipped else ""
+
+
+def _report_partial_scope(report: Report, check: str, what: str,
+                          skipped: List[List[str]]) -> None:
+    """Emit an UNKNOWN naming targets a check could not read.
+
+    A per-target API failure inside a check's loop silently shrinks that check's scope: the
+    check then reports only on the targets it reached, which can produce a PASS that hides a
+    real problem in the ones it skipped. Recording every skip and surfacing it here keeps the
+    check honest and gives --strict something to act on.
+    """
+    if not skipped:
+        return
+    report.add(Finding(check, UNKNOWN,
+                       f"{len(skipped)} {what} could not be read - this check's result is partial",
+                       "These targets were skipped because the AWS call for them failed, so any "
+                       "problem inside them would NOT appear in this check. Treat the result as "
+                       "incomplete rather than as a pass, and re-run once the cause is resolved.",
+                       cols=["Target", "Error", "Detail"], rows=skipped[:50],
+                       remediation="Grant the missing read permission, or re-run if the calls "
+                                   "were throttled."))
+
+
 def check_v4_integration_accounts_same_ou(ctx: Context, report: Report) -> None:
     """v4.0 requirement: every account configured for a service integration must sit under
     the same parent OU.
@@ -1376,12 +1426,14 @@ def check_scp_headroom(ctx: Context, report: Report) -> None:
     targets = [{"Id": r["Id"], "Name": f"(root) {r.get('Name', r['Id'])}"} for r in roots]
     targets += [{"Id": o["Id"], "Name": o["Name"]} for o in ous]
     at_limit, near_limit, custom_rows = [], [], []
+    skipped: List[List[str]] = []
     checked = 0
     for t in targets:
         try:
             scps = _collect(ctx.orgs, "list_policies_for_target", "Policies",
                             TargetId=t["Id"], Filter="SERVICE_CONTROL_POLICY")
-        except (ClientError, BotoCoreError):
+        except (ClientError, BotoCoreError) as e:
+            skipped.append([t["Name"], _error_code(e), _skip_note(e)])
             continue
         checked += 1
         count = len(scps)
@@ -1400,6 +1452,7 @@ def check_scp_headroom(ctx: Context, report: Report) -> None:
     if not checked:
         report.add(Finding("scp_headroom", UNKNOWN, "No targets queryable for SCPs"))
         return
+    _report_partial_scope(report, "scp_headroom", "SCP target(s)", skipped)
     if at_limit:
         report.add(Finding("scp_headroom", WARNING,
                            f"{len(at_limit)} target(s) at the 10-SCP attachment limit",
@@ -1414,7 +1467,8 @@ def check_scp_headroom(ctx: Context, report: Report) -> None:
                            cols=["Target", "SCPs attached"], rows=near_limit))
     else:
         report.add(Finding("scp_headroom", PASS,
-                           f"All {checked} targets have SCP headroom (<8 of 10 attached)"))
+                           f"All {checked} targets have SCP headroom (<8 of 10 attached)"
+                           f"{_scope_suffix(skipped)}"))
     if custom_rows:
         report.add(Finding("scp_custom", INFO,
                            f"{len(custom_rows)} customer-managed SCP attachment(s) on governed targets",
@@ -1443,12 +1497,14 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
 
     missing_fullaccess, risky = [], []
     doc_cache: Dict[str, Any] = {}
+    skipped: List[List[str]] = []
     checked = 0
     for t in targets:
         try:
             scps = _collect(ctx.orgs, "list_policies_for_target", "Policies",
                             TargetId=t["Id"], Filter="SERVICE_CONTROL_POLICY")
-        except (ClientError, BotoCoreError):
+        except (ClientError, BotoCoreError) as e:
+            skipped.append([t["Name"], _error_code(e), _skip_note(e)])
             continue
         checked += 1
         names = {p.get("Name", "") for p in scps}
@@ -1464,8 +1520,11 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                 try:
                     pol = ctx.orgs.describe_policy(PolicyId=pid)["Policy"]
                     doc_cache[pid] = pol.get("Content", "")
-                except (ClientError, BotoCoreError):
+                except (ClientError, BotoCoreError) as e:
+                    # Unreadable SCP content cannot be declared safe. Record it once per
+                    # policy so it surfaces as UNKNOWN instead of being skipped below.
                     doc_cache[pid] = None
+                    skipped.append([f"SCP {name} ({pid})", _error_code(e), _skip_note(e)])
             content = doc_cache.get(pid)
             if not content:
                 continue
@@ -1493,6 +1552,7 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
     if not checked:
         report.add(Finding("scp_blocking", UNKNOWN, "No targets queryable for SCP content"))
         return
+    _report_partial_scope(report, "scp_blocking", "SCP target(s)/policy document(s)", skipped)
     if missing_fullaccess:
         report.add(Finding("scp_blocking", WARNING,
                            f"FullAWSAccess SCP not attached to {len(missing_fullaccess)} target(s)",
@@ -1513,7 +1573,7 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
     if not missing_fullaccess and not risky:
         report.add(Finding("scp_blocking", PASS,
                            f"FullAWSAccess present and no CT-blocking custom SCP patterns "
-                           f"found across {checked} target(s)"))
+                           f"found across {checked} target(s){_scope_suffix(skipped)}"))
 
 
 def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
@@ -1529,15 +1589,19 @@ def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
                            "Could not list StackSets for in-progress operations", str(e)))
         return
     active = []
+    skipped: List[List[str]] = []
     for name in names:
         try:
             ops = _collect(cfn, "list_stack_set_operations", "Summaries", StackSetName=name)
-        except (ClientError, BotoCoreError):
+        except (ClientError, BotoCoreError) as e:
+            # BLOCKER-or-PASS check: an unread StackSet must not read as "no operations".
+            skipped.append([name, _error_code(e), _skip_note(e)])
             continue
         for o in ops:
             if o.get("Status") in ("RUNNING", "STOPPING", "QUEUED"):
                 active.append([name, o.get("Action", ""), o.get("Status", ""),
                                o.get("OperationId", "")])
+    _report_partial_scope(report, "stackset_ops", "AWSControlTower StackSet(s)", skipped)
     if active:
         report.add(Finding("stackset_ops", BLOCKER,
                            f"{len(active)} in-progress operation(s) on AWSControlTower* StackSets",
@@ -1548,7 +1612,8 @@ def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
                                        "before upgrading."))
     else:
         report.add(Finding("stackset_ops", PASS,
-                           f"No in-progress operations on {len(names)} AWSControlTower StackSet(s)"))
+                           f"No in-progress operations on {len(names)} AWSControlTower "
+                           f"StackSet(s){_scope_suffix(skipped)}"))
 
 
 # Foundational AWSControlTower StackSets present in EVERY Control Tower landing zone,

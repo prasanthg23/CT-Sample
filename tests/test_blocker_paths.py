@@ -1030,5 +1030,115 @@ class TestV4IntegrationAccountsSameOu(unittest.TestCase):
         self.assertIn("not applicable", f[0].summary)
 
 
+class TestPartialScopeSurfacesAsUnknown(unittest.TestCase):
+    """F-01 regression: a per-target API failure must never be absorbed into a bare PASS.
+
+    Each check below loops over targets. If one target's call fails, the check previously
+    dropped it silently and reported PASS over the remainder - so a real blocker in the
+    skipped target became a clean report. Every case must now emit an UNKNOWN too.
+    """
+
+    OU_A = {"Arn": "arn:aws:organizations::1:ou/o-x/ou-AAA", "Name": "OU-A", "Id": "ou-AAA"}
+    OU_B = {"Arn": "arn:aws:organizations::1:ou/o-x/ou-BBB", "Name": "OU-B", "Id": "ou-BBB"}
+
+    @staticmethod
+    def _err(code, op="Op"):
+        return ct.ClientError({"Error": {"Code": code, "Message": "denied"}}, op)
+
+    @staticmethod
+    def _levels(ctx, fn):
+        rep = ct.Report()
+        fn(ctx, rep)
+        return [f.level for f in rep.findings], rep.findings
+
+    def _assert_partial(self, levels):
+        self.assertIn(ct.UNKNOWN, levels, "skip was not surfaced as UNKNOWN")
+        self.assertNotEqual(levels, [ct.PASS], "check still fails open")
+
+    def test_enabled_controls_partial_ou_read(self):
+        def lec(**kw):
+            if kw.get("targetIdentifier", "").endswith("ou-BBB"):
+                raise self._err("AccessDeniedException", "ListEnabledControls")
+            return {"enabledControls": [{"controlIdentifier": "CT.OK",
+                                         "statusSummary": {"status": "SUCCEEDED"},
+                                         "driftStatusSummary": {"driftStatus": "IN_SYNC"}}]}
+        ctx = make_ctx({"controltower": FakeClient(responses={"list_enabled_controls": lec})})
+        ctx.all_ou_arns = lambda: [self.OU_A, self.OU_B]
+        levels, findings = self._levels(ctx, ct.check_enabled_controls)
+        self._assert_partial(levels)
+        passes = [f for f in findings if f.level == ct.PASS]
+        self.assertTrue(passes and "skipped" in passes[0].summary,
+                        "PASS summary should disclose the skipped count")
+
+    def test_enabled_controls_throttling_is_recorded(self):
+        """Throttling, not just AccessDenied, must surface - it is the realistic case."""
+        def lec(**kw):
+            if kw.get("targetIdentifier", "").endswith("ou-BBB"):
+                raise self._err("ThrottlingException", "ListEnabledControls")
+            return {"enabledControls": []}
+        ctx = make_ctx({"controltower": FakeClient(responses={"list_enabled_controls": lec})})
+        ctx.all_ou_arns = lambda: [self.OU_A, self.OU_B]
+        levels, findings = self._levels(ctx, ct.check_enabled_controls)
+        self._assert_partial(levels)
+        unknown = [f for f in findings if f.level == ct.UNKNOWN][0]
+        self.assertIn("ThrottlingException", " ".join(str(c) for r in unknown.rows for c in r))
+
+    def test_stacksets_partial_instance_read(self):
+        cfn = FakeClient(
+            responses={"list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-A"}]}},
+            errors={"list_stack_instances": self._err("AccessDeniedException",
+                                                     "ListStackInstances")})
+        orgs = FakeClient(responses={"list_accounts": {"Accounts": [{"Id": "111111111111"}]}})
+        levels, _ = self._levels(make_ctx({"cloudformation": cfn, "organizations": orgs}),
+                                 ct.check_stacksets)
+        self._assert_partial(levels)
+
+    def test_stackset_operations_partial_read(self):
+        cfn = FakeClient(
+            responses={"list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-A"}]}},
+            errors={"list_stack_set_operations": self._err("AccessDeniedException",
+                                                          "ListStackSetOperations")})
+        levels, _ = self._levels(make_ctx({"cloudformation": cfn}),
+                                 ct.check_stackset_operations_in_progress)
+        self._assert_partial(levels)
+
+    def test_scp_blocking_unreadable_policy_document(self):
+        orgs = FakeClient(
+            responses={"list_roots": {"Roots": [{"Id": "r-abc", "Name": "Root"}]},
+                       "list_policies_for_target": {"Policies": [
+                           {"Name": "FullAWSAccess", "Id": "p-full", "AwsManaged": True},
+                           {"Name": "CustomDeny", "Id": "p-cust"}]}},
+            errors={"describe_policy": self._err("AccessDeniedException", "DescribePolicy")})
+        ctx = make_ctx({"organizations": orgs})
+        ctx.all_ou_arns = lambda: []
+        levels, _ = self._levels(ctx, ct.check_scp_blocking)
+        self._assert_partial(levels)
+
+    def test_scp_headroom_partial_target_read(self):
+        def lpft(**kw):
+            if kw.get("TargetId") == "ou-AAA":
+                raise self._err("AccessDeniedException", "ListPoliciesForTarget")
+            return {"Policies": [{"Name": "FullAWSAccess", "Id": "p-full", "AwsManaged": True}]}
+        orgs = FakeClient(responses={"list_roots": {"Roots": [{"Id": "r-abc", "Name": "Root"}]},
+                                     "list_policies_for_target": lpft})
+        ctx = make_ctx({"organizations": orgs})
+        ctx.all_ou_arns = lambda: [self.OU_A]
+        levels, _ = self._levels(ctx, ct.check_scp_headroom)
+        self._assert_partial(levels)
+
+    def test_no_failures_emits_no_unknown(self):
+        """The fix must not add noise when everything reads cleanly."""
+        cfn = FakeClient(responses={
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-A"}]},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "111111111111", "Region": "us-east-1",
+                 "Status": "CURRENT", "DriftStatus": "IN_SYNC"}]}})
+        orgs = FakeClient(responses={"list_accounts": {"Accounts": [{"Id": "111111111111"}]}})
+        levels, _ = self._levels(make_ctx({"cloudformation": cfn, "organizations": orgs}),
+                                 ct.check_stacksets)
+        self.assertNotIn(ct.UNKNOWN, levels)
+        self.assertIn(ct.PASS, levels)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
