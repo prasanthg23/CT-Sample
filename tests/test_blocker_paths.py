@@ -1140,5 +1140,54 @@ class TestPartialScopeSurfacesAsUnknown(unittest.TestCase):
         self.assertIn(ct.PASS, levels)
 
 
+class TestExitCode(unittest.TestCase):
+    """F-04: UNKNOWN fails closed by default; WARNING does not.
+
+    An UNKNOWN means a check could not be evaluated. In front of a landing-zone update that is
+    not something to treat as "safe to proceed". A WARNING is reviewed-and-not-blocking, so it
+    must not gate unless the operator asks for it with --strict.
+    """
+
+    @staticmethod
+    def _rep(*levels):
+        r = ct.Report()
+        for lv in levels:
+            r.add(ct.Finding("t", lv, "summary"))
+        return r
+
+    def test_clean_report_is_zero(self):
+        self.assertEqual(ct.exit_code(self._rep(ct.PASS, ct.INFO)), 0)
+
+    def test_blocker_is_two(self):
+        self.assertEqual(ct.exit_code(self._rep(ct.PASS, ct.BLOCKER)), 2)
+
+    def test_unknown_fails_closed_by_default(self):
+        self.assertEqual(ct.exit_code(self._rep(ct.PASS, ct.UNKNOWN)), 2)
+
+    def test_unknown_can_be_explicitly_allowed(self):
+        self.assertEqual(ct.exit_code(self._rep(ct.PASS, ct.UNKNOWN), allow_unknown=True), 0)
+
+    def test_warning_does_not_fail_by_default(self):
+        self.assertEqual(ct.exit_code(self._rep(ct.PASS, ct.WARNING)), 0)
+
+    def test_warning_fails_under_strict(self):
+        self.assertEqual(ct.exit_code(self._rep(ct.PASS, ct.WARNING), strict=True), 2)
+
+    def test_unknown_still_fails_under_strict(self):
+        self.assertEqual(ct.exit_code(self._rep(ct.UNKNOWN), strict=True), 2)
+
+    def test_blocker_overrides_allow_unknown(self):
+        self.assertEqual(
+            ct.exit_code(self._rep(ct.BLOCKER, ct.UNKNOWN), allow_unknown=True), 2)
+
+    def test_allow_unknown_does_not_suppress_strict_warning(self):
+        self.assertEqual(
+            ct.exit_code(self._rep(ct.WARNING, ct.UNKNOWN), strict=True, allow_unknown=True), 2)
+
+    def test_allow_unknown_with_warning_and_no_strict_is_zero(self):
+        self.assertEqual(
+            ct.exit_code(self._rep(ct.WARNING, ct.UNKNOWN), allow_unknown=True), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

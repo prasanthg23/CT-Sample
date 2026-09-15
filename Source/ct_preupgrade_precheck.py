@@ -2172,6 +2172,29 @@ def render_upgrade_notes(cur: str, latest: str, use_color: bool = False) -> str:
     return "\n".join(lines)
 
 
+def exit_code(report: Report, strict: bool = False, allow_unknown: bool = False) -> int:
+    """Process exit code, for pipeline gating.
+
+    BLOCKER always fails.
+
+    UNKNOWN also fails by default. An UNKNOWN means a check could not be evaluated, and for a
+    gate in front of a landing-zone update - an operation AWS publishes a pre-update checklist
+    for - "I could not check this" must not read as "safe to proceed". Pass allow_unknown=True
+    to opt out deliberately.
+
+    WARNING does not fail by default. A WARNING is "reviewed, and not a blocker" - for example a
+    drifted StackSet instance in a member account, which this tool's own finding text states does
+    NOT block a landing-zone update. Pass strict=True to fail on warnings too.
+    """
+    if report.has_blockers:
+        return 2
+    if report.has_unknowns and not allow_unknown:
+        return 2
+    if strict and report.has_warnings:
+        return 2
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Control Tower pre-upgrade precheck (read-only)")
     ap.add_argument("--region", help="Home region (defaults to session region)")
@@ -2196,7 +2219,11 @@ def main() -> int:
                     help="When the LZ looks broken, scan shared accounts for leftover CT resources "
                          "that would collide ('already exists') when Repair/Reset recreates them")
     ap.add_argument("--strict", action="store_true",
-                    help="Treat WARNING and UNKNOWN as blocking too")
+                    help="Also treat WARNING as blocking. UNKNOWN already blocks by default "
+                         "(see --allow-unknown)")
+    ap.add_argument("--allow-unknown", action="store_true",
+                    help="Exit 0 even when one or more checks could not be evaluated (UNKNOWN). "
+                         "Off by default: an unverified check is not evidence of a safe upgrade")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="Colorize the text report: auto (TTY only, default), always, or never "
                          "(also honors the NO_COLOR environment variable)")
@@ -2257,11 +2284,8 @@ def main() -> int:
             json.dump({"findings": [_as_dict(f) for f in report.findings]}, fh, indent=2)
         print(f"\nJSON report written to {args.json}")
 
-    if report.has_blockers:
-        return 2
-    if args.strict and (report.has_warnings or report.has_unknowns):
-        return 2
-    return 0
+    return exit_code(report, strict=args.strict, allow_unknown=args.allow_unknown)
+
 
 
 if __name__ == "__main__":

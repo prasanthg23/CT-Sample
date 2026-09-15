@@ -246,14 +246,23 @@ redirected, when `--color never` is used, or when the `NO_COLOR` environment var
 
 | Code | Meaning |
 |------|---------|
-| `0` | No blockers — safe to proceed (review any warnings). |
-| `2` | One or more blockers — **do not upgrade** until resolved. |
+| `0` | No blockers, **and every check ran**. Review any warnings. |
+| `2` | One or more blockers — **do not upgrade** until resolved — **or** one or more checks could not be evaluated (`UNKNOWN`). |
 | `3` | The precheck could not run (authentication/setup problem). |
+
+`UNKNOWN` counts toward exit `2` deliberately. A check that could not run is not evidence that the
+environment is safe, and a landing-zone update is not something to start on an unverified report.
+Two flags adjust this:
+
+| Flag | Effect |
+|------|--------|
+| `--allow-unknown` | Exit `0` even when checks could not be evaluated. Use this only if you accept proceeding on an unverified report. |
+| `--strict` | Also fail on `WARNING`. Off by default, because a warning means reviewed-and-not-blocking — for example drifted StackSet instances in member accounts, which do not block a landing-zone update. |
 
 Gate an upgrade runbook simply:
 
 ```bash
-python3 Source/ct_preupgrade_precheck.py --strict || { echo "Precheck failed"; exit 1; }
+python3 Source/ct_preupgrade_precheck.py || { echo "Precheck failed"; exit 1; }
 ```
 
 ## Sample output
@@ -352,7 +361,11 @@ controls/baselines), then re-run the precheck until it is clean. See
 [Detect and resolve drift in AWS Control Tower](https://docs.aws.amazon.com/controltower/latest/userguide/drift.html).
 
 **Can I run it in a pipeline?**
-Yes. Use `--json` for a machine-readable report and gate on the exit code (see above).
+Yes. Use `--json` for a machine-readable report and gate on the exit code (see
+[Exit codes](#exit-codes-for-pipeline-gating)). Note that exit `2` covers two distinct cases — a
+real blocker, and a check that could not be evaluated — and both should stop an upgrade. Add
+`--allow-unknown` only if you deliberately want unverified checks to pass, and `--strict` if you
+also want warnings to stop the pipeline.
 
 ## Security
 
