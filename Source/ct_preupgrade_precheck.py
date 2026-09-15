@@ -10,7 +10,8 @@ ResetLandingZone). It confirms the environment is in a known-good state and surf
 issues, drift, out-of-band changes and customizations that are the documented causes of
 landing-zone update failures — so they can be fixed first.
 
-It is 100% read-only: every AWS call is a List*/Get*/Describe*/Search*. It never mutates
+It is read-only by default: every AWS call on the default path is a List*/Get*/Describe*/
+Search*, and it never mutates
 anything. It exits non-zero if any BLOCKER is found so you can gate an upgrade runbook on it.
 
 WHAT IT CHECKS  (each mapped to a documented LZ-update failure cause; see README.md)
@@ -77,15 +78,18 @@ EXIT CODES
 REQUIRED PERMISSIONS (management account, read-only)
     controltower:ListLandingZones, GetLandingZone, ListEnabledControls, ListEnabledBaselines
     organizations:ListRoots, ListOrganizationalUnitsForParent,
-                  ListAccounts, ListPolicies, ListPoliciesForTarget,
-                  ListParents,
+                  ListAccounts, ListPoliciesForTarget, ListParents,
                   ListAWSServiceAccessForOrganization, ListDelegatedAdministrators,
                   ListDelegatedServicesForAccount, DescribePolicy
     servicecatalog:SearchProvisionedProducts
-    cloudformation:ListStackSets, DescribeStackSet, ListStackInstances, ListStacks
-    iam:GetRole
-    kms:DescribeKey
+    cloudformation:ListStackSets, ListStackInstances, ListStacks, ListStackSetOperations,
+                   DescribeStackSetOperation, DescribeStackResourceDrifts
+    iam:GetRole, ListAttachedRolePolicies
+    kms:DescribeKey, GetKeyPolicy
     sts:GetCallerIdentity, AssumeRole (AssumeRole only for the cross-account Config check)
+
+    OPT-IN, STATE-CHANGING (only with --detect-drift)
+    cloudformation:DetectStackSetDrift - starts a StackSet drift-detection operation
 """
 
 import argparse
@@ -219,8 +223,14 @@ class Context:
         self.session = session
         self.region = region
         self.member_role = member_role
-        self.ct = session.client("controltower", region_name=region)
-        self.orgs = session.client("organizations", region_name=region)
+        # Adaptive retries on the two highest fan-out clients: ListEnabledControls is called
+        # once per OU and ListPoliciesForTarget once per target, so in a large organization
+        # throttling is routine. Absorbing it here keeps a throttle from becoming a skipped
+        # target, which would silently make a check's result partial.
+        from botocore.config import Config as _BotoConfig
+        _retry = _BotoConfig(retries={"mode": "adaptive", "max_attempts": 10})
+        self.ct = session.client("controltower", region_name=region, config=_retry)
+        self.orgs = session.client("organizations", region_name=region, config=_retry)
         self.lz_arn: Optional[str] = None
         self.lz: Dict[str, Any] = {}
         self.manifest: Dict[str, Any] = {}
@@ -603,6 +613,7 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
                            "Could not enumerate OUs for control drift check", str(e)))
         return
     drifted, failed = [], []
+    no_status: List[List[str]] = []
     skipped: List[List[str]] = []
     checked = 0
     for ou in ous:
@@ -625,11 +636,20 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
                 drifted.append([ou["Name"], cid, ds])
             if st and st not in ("SUCCEEDED",):
                 failed.append([ou["Name"], cid, st])
+            elif not st:
+                # A missing statusSummary is not evidence of health.
+                no_status.append([ou["Name"], cid, "statusSummary absent"])
     if not checked:
         report.add(Finding("controls_drift", UNKNOWN,
                            "No CT-registered OUs found / none queryable for enabled controls"))
         return
     _report_partial_scope(report, "controls_drift", "OU(s)", skipped)
+    if no_status:
+        report.add(Finding("controls_drift", UNKNOWN,
+                           f"{len(no_status)} enabled control(s) reported no status",
+                           "Control Tower returned no statusSummary for these controls, so their "
+                           "state is unverified. They are NOT counted as healthy.",
+                           cols=["OU", "Control", "Status"], rows=no_status[:50]))
     if drifted or failed:
         rows = drifted + failed
         report.add(Finding("controls_drift", BLOCKER,
@@ -642,7 +662,7 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
     else:
         report.add(Finding("controls_drift", PASS,
                            f"All enabled controls SUCCEEDED and IN_SYNC across {checked} OU(s)"
-                           f"{_scope_suffix(skipped)}"))
+                           f"{_scope_suffix(skipped + no_status)}"))
 
 
 def check_enabled_baselines(ctx: Context, report: Report) -> None:
@@ -654,6 +674,7 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
                            "Could not list enabled baselines", str(e)))
         return
     bad = []
+    no_status: List[List[str]] = []
     for b in baselines:
         st = (b.get("statusSummary") or {}).get("status")
         ds = (b.get("driftStatusSummary") or {}).get("driftStatus")
@@ -662,6 +683,15 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
             bad.append([tgt, b.get("baselineVersion", ""), st or "", ds or ""])
         elif ds == "DRIFTED":
             bad.append([tgt, b.get("baselineVersion", ""), st or "", ds])
+        elif not st:
+            # A missing statusSummary is not evidence of health.
+            no_status.append([tgt, b.get("baselineVersion", ""), "absent", ds or ""])
+    if no_status:
+        report.add(Finding("baselines_drift", UNKNOWN,
+                           f"{len(no_status)} enabled baseline(s) reported no status",
+                           "Control Tower returned no statusSummary for these baselines, so "
+                           "their state is unverified. They are NOT counted as healthy.",
+                           cols=["Target", "Version", "Status", "Drift"], rows=no_status[:50]))
     if bad:
         report.add(Finding("baselines_drift", BLOCKER,
                            f"{len(bad)} enabled baseline(s) drifted or not SUCCEEDED",
@@ -671,7 +701,8 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
                            remediation="reset-enabled-baseline / re-register OU."))
     else:
         report.add(Finding("baselines_drift", PASS,
-                           f"All {len(baselines)} enabled baselines SUCCEEDED / IN_SYNC"))
+                           f"All {len(baselines)} enabled baselines SUCCEEDED / IN_SYNC"
+                           f"{_scope_suffix(no_status)}"))
 
 
 def check_stacksets(ctx: Context, report: Report) -> None:
@@ -2218,7 +2249,11 @@ def main() -> int:
             d = asdict(f)
             d["doc"] = f.doc or _CHECK_DOCS.get(f.check, "")
             return d
-        with open(args.json, "w") as fh:
+        # The report carries the organization's account IDs, OU identifiers, ARNs, resource
+        # names and verbatim API error strings, so create it 0600 (not world-readable at the
+        # default umask) and refuse to follow a symlink rather than clobber its target.
+        _flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(args.json, _flags, 0o600), "w") as fh:
             json.dump({"findings": [_as_dict(f) for f in report.findings]}, fh, indent=2)
         print(f"\nJSON report written to {args.json}")
 

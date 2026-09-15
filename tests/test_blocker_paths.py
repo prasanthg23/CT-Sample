@@ -74,7 +74,7 @@ class FakeSession:
     def __init__(self, clients):
         self._clients = clients
 
-    def client(self, service, region_name=None):
+    def client(self, service, region_name=None, **kwargs):
         return self._clients.get(service, FakeClient())
 
     def get_credentials(self):
@@ -94,8 +94,8 @@ def make_ctx(clients=None, **overrides):
     })
     ctx.manifest = overrides.get("manifest", {})
     ctx.governed_regions = overrides.get("governed_regions", ["us-east-1"])
-    ctx.audit_account = overrides.get("audit_account", "547106939137")
-    ctx.log_archive_account = overrides.get("log_archive_account", "944915248067")
+    ctx.audit_account = overrides.get("audit_account", "444444444444")
+    ctx.log_archive_account = overrides.get("log_archive_account", "555555555555")
     ctx.kms_key_arn = overrides.get("kms_key_arn", None)
     return ctx
 
@@ -444,7 +444,7 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.UNKNOWN, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
-    def test_sts_region_disabled_blocks(self):
+    def test_sts_region_disabled_blocks_single_region(self):
         ctx = make_ctx()
         ctx.governed_regions = ["ap-east-1"]
         with mock.patch.object(

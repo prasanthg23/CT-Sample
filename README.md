@@ -2,7 +2,7 @@
 
 ![AWS](https://img.shields.io/badge/AWS-Control%20Tower-orange)
 ![Language](https://img.shields.io/badge/python-3.8%2B-blue)
-![Access](https://img.shields.io/badge/access-read--only-brightgreen)
+![Access](https://img.shields.io/badge/access-read--only_by_default-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT--0-green)
 
 > **Disclaimer:** This code is provided as-is to demonstrate a concept or workflow for AWS
@@ -123,43 +123,77 @@ If it does not, the tool emits a WARNING (not a blocker).
   ```json
   {
     "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": [
-        "controltower:ListLandingZones",
-        "controltower:GetLandingZone",
-        "controltower:ListEnabledControls",
-        "controltower:ListEnabledBaselines",
-        "organizations:ListRoots",
-        "organizations:ListOrganizationalUnitsForParent",
-        "organizations:ListParents",
-        "organizations:ListAccounts",
-        "organizations:ListPolicies",
-        "organizations:ListPoliciesForTarget",
-        "organizations:DescribePolicy",
-        "organizations:ListAWSServiceAccessForOrganization",
-        "organizations:ListDelegatedAdministrators",
-        "organizations:ListDelegatedServicesForAccount",
-        "servicecatalog:SearchProvisionedProducts",
-        "cloudformation:ListStackSets",
-        "cloudformation:DescribeStackSet",
-        "cloudformation:ListStackInstances",
-        "cloudformation:ListStacks",
-        "cloudformation:ListStackSetOperations",
-        "cloudformation:DetectStackSetDrift",
-        "cloudformation:DescribeStackSetOperation",
-        "cloudformation:DescribeStackResourceDrifts",
-        "iam:GetRole",
-        "iam:ListAttachedRolePolicies",
-        "kms:DescribeKey",
-        "kms:GetKeyPolicy",
-        "sts:GetCallerIdentity",
-        "sts:AssumeRole"
-      ],
-      "Resource": "*"
-    }]
+    "Statement": [
+      {
+        "Sid": "ReadOnlyPrecheck",
+        "Effect": "Allow",
+        "Action": [
+          "controltower:ListLandingZones",
+          "controltower:GetLandingZone",
+          "controltower:ListEnabledControls",
+          "controltower:ListEnabledBaselines",
+          "organizations:ListRoots",
+          "organizations:ListOrganizationalUnitsForParent",
+          "organizations:ListParents",
+          "organizations:ListAccounts",
+          "organizations:ListPoliciesForTarget",
+          "organizations:DescribePolicy",
+          "organizations:ListAWSServiceAccessForOrganization",
+          "organizations:ListDelegatedAdministrators",
+          "organizations:ListDelegatedServicesForAccount",
+          "servicecatalog:SearchProvisionedProducts",
+          "cloudformation:ListStackSets",
+          "cloudformation:ListStackInstances",
+          "cloudformation:ListStacks",
+          "cloudformation:ListStackSetOperations",
+          "sts:GetCallerIdentity"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "ControlTowerRoleReads",
+        "Effect": "Allow",
+        "Action": ["iam:GetRole", "iam:ListAttachedRolePolicies"],
+        "Resource": "arn:aws:iam::*:role/AWSControlTower*"
+      },
+      {
+        "Sid": "LandingZoneKeyReads",
+        "Effect": "Allow",
+        "Action": ["kms:DescribeKey", "kms:GetKeyPolicy"],
+        "Resource": "<landing-zone-cmk-arn>"
+      },
+      {
+        "Sid": "CrossAccountReadOnlyChecks",
+        "Effect": "Allow",
+        "Action": "sts:AssumeRole",
+        "Resource": "arn:aws:iam::*:role/AWSControlTowerExecution"
+      },
+      {
+        "Sid": "OptInActiveDriftDetectionOnly",
+        "Effect": "Allow",
+        "Action": [
+          "cloudformation:DetectStackSetDrift",
+          "cloudformation:DescribeStackSetOperation"
+        ],
+        "Resource": "arn:aws:cloudformation:*:*:stackset/AWSControlTower*:*"
+      }
+    ]
   }
   ```
+
+  Notes on this policy:
+
+  - The last statement, `OptInActiveDriftDetectionOnly`, is needed **only** if you use
+    `--detect-drift`. `DetectStackSetDrift` is state-changing (it starts a StackSet operation), so
+    omit this statement entirely for a strictly read-only role.
+  - `iam:*`, `kms:*` and `sts:AssumeRole` are scoped by resource rather than `*`. Replace
+    `<landing-zone-cmk-arn>` with your landing zone's CMK ARN, or drop that statement if your
+    landing zone does not use a customer-managed key.
+  - The cross-account checks additionally need, **in the shared/member accounts** via the assumed
+    role: `cloudformation:DescribeStackResourceDrifts`, `config:DescribeConfigurationRecorders`,
+    `config:DescribeDeliveryChannels`, `iam:GetRole`, `sns:ListTopics`,
+    `logs:DescribeLogGroups`, `lambda:GetFunction`, `events:ListRules`,
+    `cloudtrail:DescribeTrails`, `s3:ListAllMyBuckets` and `sts:GetCallerIdentity`.
 
 - (Optional, for check #9) A role assumable in the Audit and Log Archive accounts. The tool
   defaults to `AWSControlTowerExecution`, which the management account can already assume. If that
@@ -168,8 +202,8 @@ If it does not, the tool emits a WARNING (not a blocker).
 ## Installation
 
 ```bash
-git clone <your-fork-url> sample-controltower-preupgrade-precheck
-cd sample-controltower-preupgrade-precheck
+git clone <your-fork-url> sample-controltower-upgrade-precheck
+cd sample-controltower-upgrade-precheck
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -270,7 +304,7 @@ severity fires (e.g. DRIFTED → BLOCKER, OUTDATED StackSet → INFO, unreachabl
 UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
 
 ```bash
-python3 tests/test_blocker_paths.py      # 59 tests, plain unittest (no extra deps)
+python3 tests/test_blocker_paths.py      # 106 tests, plain unittest (no extra deps)
 ```
 
 This complements a live run against a healthy landing zone (which only exercises the PASS/INFO
@@ -298,8 +332,16 @@ This tool reduces upgrade failures; it does not guarantee success. Be aware of t
 ## FAQs
 
 **Does this change anything in my environment?**
-No. Every call is read-only (`List*`/`Get*`/`Describe*`/`Search*`). It cannot create, modify, or
-delete resources.
+Not on the default path — every call is a `List*`/`Get*`/`Describe*`/`Search*`, and nothing is
+created, modified or deleted.
+
+There is one exception, and it is opt-in. `--detect-drift` calls
+`cloudformation:DetectStackSetDrift`, which **starts** a CloudFormation drift-detection operation
+on the `AWSControlTower*` StackSets. That is a state-changing API. It does not alter your
+resources, but it does create an operation that runs for a while — and Control Tower cannot
+update a landing zone while a StackSet operation on its StackSets is in progress (this tool's own
+check #18 treats that as a BLOCKER). Leave `--detect-drift` off unless you specifically want
+active drift detection.
 
 **Where do I run it?**
 The Control Tower **management account**, in the **home Region**.
@@ -317,6 +359,24 @@ Yes. Use `--json` for a machine-readable report and gate on the exit code (see a
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to report a potential
 security issue. This tool requires only read-only permissions; grant it a least-privilege,
 read-only role and do not store long-lived credentials.
+
+**Treat the report output as sensitive.** Both the console report and the optional `--json` file
+contain your own infrastructure topology and identity metadata, specifically: management, audit,
+log archive and member account IDs; OU names and IDs; StackSet names; stack instance Regions and
+statuses; resource-level drift detail; IAM role names; the landing zone KMS key ARN; SCP names and
+IDs; Service Catalog provisioned product names; delegated administrator account IDs; the governed
+Region list; and verbatim AWS API error messages (one of which can include the calling
+principal's ARN). No credential material, SCP policy content or account email addresses are
+included.
+
+Two practical consequences:
+
+- The `--json` file is created mode `0600` and will not follow a symlink, but you still choose
+  where it lands. Write it somewhere access-controlled, and remember `.gitignore` already excludes
+  `report.json` and `*.report.json` so a report cannot be committed by accident.
+- The console report goes to **stdout**. If you run this in a pipeline, that output lands in build
+  logs, which typically have wider access and longer retention than an operator expects. Redirect
+  it deliberately if that matters to you.
 
 ## Notices
 
