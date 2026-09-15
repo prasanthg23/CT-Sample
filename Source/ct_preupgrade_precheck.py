@@ -886,7 +886,9 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                     failed.append([name, f"operation_{st}", ""])
                 break
             if time.time() > deadline:
-                failed.append([name, "timeout", ""])
+                failed.append([name, "timeout",
+                               "still running at timeout; deliberately not stopped - see the "
+                               "finding detail and check #18 below"])
                 break
             time.sleep(10)
 
@@ -949,10 +951,23 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
     if failed:
         report.add(Finding("stackset_drift", UNKNOWN,
                            f"Drift detection did not complete for {len(failed)} StackSet(s)",
-                           "Their drift state is unverified (detection failed or timed out).",
+                           "Their drift state is unverified (detection failed or timed out).\n"
+                           "A --drift-timeout expiry does NOT stop the operation, and that is "
+                           "deliberate: drift detection makes no changes to your resources and "
+                           "finishes on its own, whereas calling StopStackSetOperation would "
+                           "leave the StackSet in STOPPING - a state that blocks a landing-zone "
+                           "update exactly as RUNNING does. Control Tower cannot update a landing "
+                           "zone while any operation on its StackSets is in progress, so an "
+                           "operation still active here is reported as a BLOCKER by check #18 "
+                           "(in-progress StackSet operations), which runs immediately after this "
+                           "check in the same invocation. This finding is itself UNKNOWN, which "
+                           "fails the exit code by default.",
                            cols=["StackSet", "Reason", "Detail"], rows=failed[:50],
-                           remediation="Re-run with a larger --drift-timeout, or check StackSet "
-                                       "drift-detection permissions."))
+                           remediation="Re-run the precheck to confirm the operation has "
+                                       "finished, or raise --drift-timeout. Do not start the "
+                                       "upgrade while check #18 reports an in-progress "
+                                       "operation, or check StackSet drift-detection "
+                                       "permissions if detection failed outright."))
     if not shared_drifted and not member_drifted and not failed:
         report.add(Finding("stackset_drift", PASS,
                            f"Active drift detection: no drift across {len(names)} "
