@@ -1126,6 +1126,25 @@ class TestPartialScopeSurfacesAsUnknown(unittest.TestCase):
         levels, _ = self._levels(ctx, ct.check_scp_headroom)
         self._assert_partial(levels)
 
+    def test_orphaned_resource_probe_skips_surface(self):
+        """The nine silent `except: pass` probe failures are now reported as UNKNOWN."""
+        denied = self._err("AccessDeniedException", "ListTopics")
+
+        class Boom(FakeClient):
+            def __getattr__(self, name):
+                def _call(**kwargs):
+                    raise denied
+                return _call
+
+        ctx = make_ctx({"cloudformation": FakeClient(
+            responses={"list_stack_sets": {"Summaries": []}})})
+        ctx.check_orphaned_resources = True
+        ctx.lz = {"status": "FAILED", "version": "3.3", "latestAvailableVersion": "4.0",
+                  "driftStatus": {"status": "IN_SYNC"}}
+        ctx.assume = lambda a, r, s: Boom()
+        levels, _ = self._levels(ctx, ct.check_orphaned_ct_resources)
+        self._assert_partial(levels)
+
     def test_no_failures_emits_no_unknown(self):
         """The fix must not add noise when everything reads cleanly."""
         cfn = FakeClient(responses={
@@ -1187,6 +1206,72 @@ class TestExitCode(unittest.TestCase):
     def test_allow_unknown_with_warning_and_no_strict_is_zero(self):
         self.assertEqual(
             ct.exit_code(self._rep(ct.WARNING, ct.UNKNOWN), allow_unknown=True), 0)
+
+
+class TestConfigSharedAccounts(unittest.TestCase):
+    """F-07: Control Tower's own Config resources are identified by name, so a single
+    pre-existing customer recorder in a newly governed Region is caught - the case a
+    count-based (`len(recs) > 1`) test could not see.
+    """
+
+    CT_REC = {"name": "aws-controltower-BaselineConfigRecorder"}
+    CT_CHAN = {"name": "aws-controltower-BaselineConfigDeliveryChannel"}
+
+    def _ctx(self, recorders=None, channels=None, raise_on_assume=False):
+        cfg = FakeClient(responses={
+            "describe_configuration_recorders": {"ConfigurationRecorders": recorders or []},
+            "describe_delivery_channels": {"DeliveryChannels": channels or []},
+        })
+        ctx = make_ctx()
+        if raise_on_assume:
+            def _boom(*a, **k):
+                raise ct.ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "AssumeRole")
+            ctx.assume = _boom
+        else:
+            ctx.assume = lambda acct, region, svc: cfg
+        return ctx
+
+    @staticmethod
+    def _run(ctx):
+        rep = ct.Report()
+        ct.check_config_in_shared_accounts(ctx, rep)
+        return [f.level for f in rep.findings], rep.findings
+
+    def test_single_preexisting_recorder_is_flagged(self):
+        lv, f = self._run(self._ctx(recorders=[{"name": "default"}]))
+        self.assertEqual(lv, [ct.WARNING])
+        self.assertIn("non-Control Tower", f[0].summary)
+
+    def test_control_tower_recorder_alone_passes(self):
+        lv, _ = self._run(self._ctx(recorders=[self.CT_REC]))
+        self.assertEqual(lv, [ct.PASS])
+
+    def test_foreign_delivery_channel_is_flagged(self):
+        lv, f = self._run(self._ctx(recorders=[self.CT_REC],
+                                    channels=[{"name": "my-own-channel"}]))
+        self.assertEqual(lv, [ct.WARNING])
+        self.assertTrue(any("delivery channel" in str(r).lower() for r in f[0].rows))
+
+    def test_control_tower_channel_alone_passes(self):
+        lv, _ = self._run(self._ctx(recorders=[self.CT_REC], channels=[self.CT_CHAN]))
+        self.assertEqual(lv, [ct.PASS])
+
+    def test_unnamed_recorder_is_flagged(self):
+        lv, _ = self._run(self._ctx(recorders=[{}]))
+        self.assertEqual(lv, [ct.WARNING])
+
+    def test_assume_failure_is_unknown_not_pass(self):
+        lv, _ = self._run(self._ctx(raise_on_assume=True))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
+    def test_no_shared_accounts_is_unknown(self):
+        ctx = self._ctx()
+        ctx.audit_account = None
+        ctx.log_archive_account = None
+        lv, _ = self._run(ctx)
+        self.assertEqual(lv, [ct.UNKNOWN])
 
 
 if __name__ == "__main__":

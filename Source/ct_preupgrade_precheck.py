@@ -975,11 +975,19 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
 
 
 def check_config_in_shared_accounts(ctx: Context, report: Report) -> None:
-    """Flag extra/foreign AWS Config recorders in the Audit/Log Archive shared accounts (more than
-    the single Control Tower-managed recorder), which can block a landing-zone update. On landing
-    zone 4.0+ the AWS Config integration is optional and may use a dedicated Config account, so a
-    recorder's absence is not itself a problem — this check only warns on EXTRA recorders, and
-    otherwise degrades to UNKNOWN when the shared accounts cannot be resolved/assumed."""
+    """Flag AWS Config recorders and delivery channels in the Audit/Log Archive shared accounts
+    that Control Tower did not create, which can block a landing-zone update.
+
+    Control Tower names its own resources aws-controltower-*, so anything otherwise named is
+    pre-existing or foreign and is flagged regardless of how many exist. That matters: the
+    canonical documented blocker is a Region newly entering governance where the customer already
+    has a Config recorder and Control Tower has not deployed its own yet - a count-based test
+    ("more than one recorder") cannot see that case.
+
+    On landing zone 4.0+ the AWS Config integration is optional and may use a dedicated Config
+    account, so the absence of a Control Tower recorder is not itself a problem. The check
+    degrades to UNKNOWN when the shared accounts cannot be resolved or assumed.
+    """
     targets = []
     if ctx.audit_account:
         targets.append(("Audit", ctx.audit_account))
@@ -997,22 +1005,39 @@ def check_config_in_shared_accounts(ctx: Context, report: Report) -> None:
         for region in ctx.governed_regions:
             try:
                 cfg = ctx.assume(acct, region, "config")
-                recs = cfg.describe_configuration_recorders().get("ConfigurationRecorders", [])
-                # CT manages exactly one recorder; extra/foreign recorders are the problem.
-                if len(recs) > 1:
-                    findings_rows.append([label, acct, region,
-                                          f"{len(recs)} configuration recorders"])
+                # Control Tower names its own resources aws-controltower-*; anything else is
+                # pre-existing or foreign. Counting recorders (> 1) misses the canonical
+                # documented blocker: in a Region newly entering governance, Control Tower has
+                # not deployed its own recorder yet, so a single pre-existing customer recorder
+                # counts as 1 and would not be flagged - which is exactly the case that blocks
+                # the update.
+                for rec in cfg.describe_configuration_recorders().get(
+                        "ConfigurationRecorders", []):
+                    nm = rec.get("name") or ""
+                    if "aws-controltower" not in nm:
+                        findings_rows.append([label, acct, region,
+                                              "Config recorder", nm or "(unnamed)"])
+                for dc in cfg.describe_delivery_channels().get("DeliveryChannels", []):
+                    nm = dc.get("name") or ""
+                    if "aws-controltower" not in nm:
+                        findings_rows.append([label, acct, region,
+                                              "Config delivery channel", nm or "(unnamed)"])
             except (ClientError, BotoCoreError):
                 unknown = True
     if findings_rows:
         report.add(Finding("config_shared", WARNING,
-                           "Extra AWS Config recorder(s) found in shared accounts",
-                           "Additional/foreign Config recorders in the Audit or Log Archive "
-                           "accounts can block the landing-zone update.",
-                           cols=["Account Type", "Account", "Region", "Observation"],
+                           f"{len(findings_rows)} non-Control Tower AWS Config resource(s) in "
+                           "shared accounts",
+                           "AWS Config recorders or delivery channels that Control Tower did not "
+                           "create (name is not aws-controltower-*) in the Audit or Log Archive "
+                           "accounts can block a landing-zone update. This is most commonly hit "
+                           "when a Region is newly brought into governance and a pre-existing "
+                           "customer recorder is already present there.",
+                           cols=["Account Type", "Account", "Region", "Resource", "Name"],
                            rows=findings_rows,
-                           remediation=f"{DOC}/troubleshooting.html (AWS Config resources in "
-                                       "Security OU accounts)."))
+                           remediation=f"{DOC}/existing-config-resources.html - remove or "
+                                       "reconcile the pre-existing Config resource(s) before "
+                                       "upgrading."))
     elif unknown:
         report.add(Finding("config_shared", UNKNOWN,
                            "Could not assume role into one or more shared accounts to inspect "
@@ -1020,7 +1045,8 @@ def check_config_in_shared_accounts(ctx: Context, report: Report) -> None:
                            remediation="Grant the precheck --member-role in the shared accounts."))
     else:
         report.add(Finding("config_shared", PASS,
-                           "No extra Config recorders in Audit/Log Archive shared accounts"))
+                           "No non-Control Tower Config recorders or delivery channels in the "
+                           "Audit/Log Archive shared accounts"))
 
 
 def check_customizations(ctx: Context, report: Report) -> None:
@@ -1271,6 +1297,12 @@ def _skip_note(e: Exception) -> str:
 def _scope_suffix(skipped: List[List[str]]) -> str:
     """Suffix for a PASS summary when part of the check's scope could not be read."""
     return f" ({len(skipped)} target(s) skipped - see UNKNOWN)" if skipped else ""
+
+
+def _note_skip(skipped: Optional[List[List[str]]], what: str, e: Exception) -> None:
+    """Record a per-resource probe failure, if the caller is collecting them."""
+    if skipped is not None:
+        skipped.append([what, _error_code(e), _skip_note(e)])
 
 
 def _report_partial_scope(report: Report, check: str, what: str,
@@ -1754,11 +1786,16 @@ _ORPHAN_S3_PREFIXES = ("aws-controltower-logs-", "aws-controltower-s3-access-log
                        "aws-controltower-config-logs-", "aws-controltower-config-access-logs-")
 
 
-def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[List[str]]:
+def _probe_orphaned_resources(ctx: Context, acct: str, present: set,
+                              skipped: Optional[List[List[str]]] = None) -> List[List[str]]:
     """Read-only probe of one shared account for baseline-created resources that still exist
     even though the StackSet that manages them is gone (a recreate-collision risk on
     Repair/Reset). Returns rows [resource type, name]. Raises only if the account can't be
-    assumed at all (caller marks it UNKNOWN); individual services degrade silently.
+    assumed at all (caller marks it UNKNOWN).
+
+    Individual service probes can fail independently (denied, throttled, service not enabled).
+    Each failure is appended to `skipped` so the caller can report that this scan's coverage is
+    incomplete - a probe that could not run is not evidence that nothing is orphaned.
     Regional resources are checked in the home region."""
     def _orphaned(guards: List[str]) -> bool:
         return not any(g in present for g in guards)
@@ -1774,9 +1811,9 @@ def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[Lis
             rows.append(["IAM role", role])
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") != "NoSuchEntity":
-                continue  # permission error -> can't confirm; skip
-        except BotoCoreError:
-            continue
+                _note_skip(skipped, f"IAM role {role}", e)
+        except BotoCoreError as e:
+            _note_skip(skipped, f"IAM role {role}", e)
 
     if _orphaned(_SS_CONFIG):
         try:
@@ -1787,8 +1824,8 @@ def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[Lis
             for dc in cfg.describe_delivery_channels().get("DeliveryChannels", []):
                 if "aws-controltower" in (dc.get("name") or ""):
                     rows.append(["Config delivery channel", dc.get("name", "")])
-        except (ClientError, BotoCoreError):
-            pass
+        except (ClientError, BotoCoreError) as e:
+            _note_skip(skipped, "AWS Config recorders / delivery channels", e)
 
     if _orphaned(_SS_SECURITY):
         try:
@@ -1797,8 +1834,8 @@ def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[Lis
                 name = t.get("TopicArn", "").split(":")[-1]
                 if name in _ORPHAN_SNS_TOPICS:
                     rows.append(["SNS topic", name])
-        except (ClientError, BotoCoreError):
-            pass
+        except (ClientError, BotoCoreError) as e:
+            _note_skip(skipped, "SNS topics", e)
 
     try:
         logs = ctx.assume(acct, ctx.region, "logs")
@@ -1810,8 +1847,8 @@ def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[Lis
             for lg in _collect(logs, "describe_log_groups", "logGroups",
                                logGroupNamePrefix="/aws/lambda/aws-controltower-NotificationForwarder"):
                 rows.append(["CloudWatch log group", lg.get("logGroupName", "")])
-    except (ClientError, BotoCoreError):
-        pass
+    except (ClientError, BotoCoreError) as e:
+        _note_skip(skipped, "CloudWatch log groups", e)
 
     if _orphaned(_SS_CLOUDWATCH):
         try:
@@ -1821,18 +1858,18 @@ def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[Lis
                 rows.append(["Lambda function", "aws-controltower-NotificationForwarder"])
             except ClientError as e:
                 if e.response.get("Error", {}).get("Code") not in ("ResourceNotFoundException", "404"):
-                    pass
-            except BotoCoreError:
-                pass
-        except (ClientError, BotoCoreError):
-            pass
+                    _note_skip(skipped, "Lambda aws-controltower-NotificationForwarder", e)
+            except BotoCoreError as e:
+                _note_skip(skipped, "Lambda aws-controltower-NotificationForwarder", e)
+        except (ClientError, BotoCoreError) as e:
+            _note_skip(skipped, "Lambda (assume role)", e)
         try:
             ev = ctx.assume(acct, ctx.region, "events")
             for r in _collect(ev, "list_rules", "Rules",
                               NamePrefix="aws-controltower-ConfigComplianceChangeEventRule"):
                 rows.append(["EventBridge rule", r.get("Name", "")])
-        except (ClientError, BotoCoreError):
-            pass
+        except (ClientError, BotoCoreError) as e:
+            _note_skip(skipped, "EventBridge rules", e)
 
     if _orphaned(_SS_CLOUDTRAIL):
         try:
@@ -1840,8 +1877,8 @@ def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[Lis
             for tr in ct_cli.describe_trails(
                     trailNameList=["aws-controltower-BaselineCloudTrail"]).get("trailList", []):
                 rows.append(["CloudTrail trail", tr.get("Name", "aws-controltower-BaselineCloudTrail")])
-        except (ClientError, BotoCoreError):
-            pass
+        except (ClientError, BotoCoreError) as e:
+            _note_skip(skipped, "CloudTrail trails", e)
 
     if _orphaned(_SS_S3):
         try:
@@ -1850,8 +1887,8 @@ def _probe_orphaned_resources(ctx: Context, acct: str, present: set) -> List[Lis
                 nm = b.get("Name", "")
                 if nm.startswith(_ORPHAN_S3_PREFIXES):
                     rows.append(["S3 bucket", nm])
-        except (ClientError, BotoCoreError):
-            pass
+        except (ClientError, BotoCoreError) as e:
+            _note_skip(skipped, "S3 buckets", e)
 
     return rows
 
@@ -1893,15 +1930,19 @@ def check_orphaned_ct_resources(ctx: Context, report: Report) -> None:
         targets.append(("Audit", ctx.audit_account))
     if ctx.log_archive_account:
         targets.append(("LogArchive", ctx.log_archive_account))
-    rows, unknown = [], []
+    rows, unknown, skipped = [], [], []
     for label, acct in targets:
+        acct_skips: List[List[str]] = []
         try:
-            found = _probe_orphaned_resources(ctx, acct, present)
+            found = _probe_orphaned_resources(ctx, acct, present, acct_skips)
         except Exception:
             unknown.append(f"{label} ({acct})")
             continue
         for kind, name in found:
             rows.append([label, acct, kind, name])
+        for s in acct_skips:
+            skipped.append([f"{label} ({acct}): {s[0]}", s[1], s[2]])
+    _report_partial_scope(report, "orphaned_resources", "resource probe(s)", skipped)
     if rows:
         report.add(Finding("orphaned_resources", WARNING,
                            f"{len(rows)} leftover Control Tower resource(s) may collide on Repair/Reset",
@@ -1921,7 +1962,8 @@ def check_orphaned_ct_resources(ctx: Context, report: Report) -> None:
                            remediation="Verify the --member-role exists/assumable in the shared accounts."))
     else:
         report.add(Finding("orphaned_resources", PASS,
-                           "No orphaned CT resources (managing StackSet missing) in the shared accounts"))
+                           "No orphaned CT resources (managing StackSet missing) in the shared "
+                           f"accounts{_scope_suffix(skipped)}"))
 
 
 def check_provisioned_product_health(ctx: Context, report: Report) -> None:
