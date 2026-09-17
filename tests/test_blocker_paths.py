@@ -1274,5 +1274,59 @@ class TestConfigSharedAccounts(unittest.TestCase):
         self.assertEqual(lv, [ct.UNKNOWN])
 
 
+class TestReportRenderingSafety(unittest.TestCase):
+    """F-12: resource names reach the report from AWS API responses, so control characters
+    must not reach the terminal, and truncation must be disclosed rather than silent.
+    """
+
+    @staticmethod
+    def _render(finding):
+        rep = ct.Report()
+        rep.add(finding)
+        return ct.render_text(rep, make_ctx(), use_color=False)
+
+    def test_ansi_escape_in_cell_is_neutralised(self):
+        out = self._render(ct.Finding("t", ct.WARNING, "s", cols=["OU"],
+                                      rows=[["\x1b[31mred-ou\x1b[0m"]]))
+        self.assertNotIn("\x1b", out)
+        self.assertIn("red-ou", out)
+
+    def test_carriage_return_cannot_overwrite_a_line(self):
+        out = self._render(ct.Finding("t", ct.WARNING, "s", cols=["OU"],
+                                      rows=[["ou\r          [OK] all good"]]))
+        self.assertNotIn("\r", out)
+
+    def test_pipe_in_cell_cannot_fake_a_column_break(self):
+        out = self._render(ct.Finding("t", ct.WARNING, "s", cols=["OU", "Status"],
+                                      rows=[["a|b", "OK"]]))
+        self.assertIn("a/b", out)
+
+    def test_control_chars_in_summary_are_neutralised(self):
+        out = self._render(ct.Finding("t", ct.WARNING, "bad\x1b[2Jsummary"))
+        self.assertNotIn("\x1b", out)
+
+    def test_control_chars_in_remediation_are_neutralised(self):
+        out = self._render(ct.Finding("t", ct.WARNING, "s", remediation="do\x1b[1mthis"))
+        self.assertNotIn("\x1b", out)
+
+    def test_rows_beyond_the_display_cap_are_disclosed(self):
+        extra = 7
+        rows = [[f"ou-{i}"] for i in range(ct._MAX_DISPLAY_ROWS + extra)]
+        f = ct.Finding("t", ct.WARNING, "s", cols=["OU"], rows=rows)
+        out = self._render(f)
+        self.assertIn(f"and {extra} more row(s) not shown", out)
+        # The Finding keeps every row, so the --json report stays complete.
+        self.assertEqual(len(f.rows), ct._MAX_DISPLAY_ROWS + extra)
+
+    def test_no_truncation_marker_when_under_the_cap(self):
+        out = self._render(ct.Finding("t", ct.WARNING, "s", cols=["OU"],
+                                      rows=[["ou-1"], ["ou-2"]]))
+        self.assertNotIn("more row(s) not shown", out)
+
+    def test_detail_newlines_are_preserved(self):
+        out = self._render(ct.Finding("t", ct.UNKNOWN, "s", detail="line one\nline two"))
+        self.assertIn("line one\nline two", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

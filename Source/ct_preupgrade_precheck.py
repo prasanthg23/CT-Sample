@@ -649,7 +649,7 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
                            f"{len(no_status)} enabled control(s) reported no status",
                            "Control Tower returned no statusSummary for these controls, so their "
                            "state is unverified. They are NOT counted as healthy.",
-                           cols=["OU", "Control", "Status"], rows=no_status[:50]))
+                           cols=["OU", "Control", "Status"], rows=no_status))
     if drifted or failed:
         rows = drifted + failed
         report.add(Finding("controls_drift", BLOCKER,
@@ -691,7 +691,7 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
                            f"{len(no_status)} enabled baseline(s) reported no status",
                            "Control Tower returned no statusSummary for these baselines, so "
                            "their state is unverified. They are NOT counted as healthy.",
-                           cols=["Target", "Version", "Status", "Drift"], rows=no_status[:50]))
+                           cols=["Target", "Version", "Status", "Drift"], rows=no_status))
     if bad:
         report.add(Finding("baselines_drift", BLOCKER,
                            f"{len(bad)} enabled baseline(s) drifted or not SUCCEEDED",
@@ -788,7 +788,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                            "These instances belong to account(s) that have left the organization. "
                            "Control Tower does not act on them during a landing-zone update, so they "
                            "do NOT block it — but they are safe to clean up.",
-                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=orphaned[:50],
+                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=orphaned,
                            remediation="Optionally delete these stale instances "
                                        "(DeleteStackInstances with RetainStacks) to tidy up."))
     if not shared_bad and not member_bad:
@@ -799,7 +799,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                                "normal when a landing-zone update is pending, and the update will "
                                "refresh them. No inoperable/failed/drifted instances were found.",
                                cols=["StackSet", "Account", "Region", "Status", "Drift"],
-                               rows=outdated[:50]))
+                               rows=outdated))
         elif not orphaned:
             report.add(Finding("stacksets", PASS,
                                f"All instances CURRENT across {len(names)} AWSControlTower "
@@ -947,7 +947,7 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                            f"{len(orphaned_drifted)} DRIFTED instance(s) target accounts no longer in the org",
                            "Drifted, but for departed accounts — stale leftovers, not a blocker.",
                            cols=["StackSet", "Account", "Region", "Status", "Drift"],
-                           rows=orphaned_drifted[:50]))
+                           rows=orphaned_drifted))
     if failed:
         report.add(Finding("stackset_drift", UNKNOWN,
                            f"Drift detection did not complete for {len(failed)} StackSet(s)",
@@ -962,7 +962,7 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                            "(in-progress StackSet operations), which runs immediately after this "
                            "check in the same invocation. This finding is itself UNKNOWN, which "
                            "fails the exit code by default.",
-                           cols=["StackSet", "Reason", "Detail"], rows=failed[:50],
+                           cols=["StackSet", "Reason", "Detail"], rows=failed,
                            remediation="Re-run the precheck to confirm the operation has "
                                        "finished, or raise --drift-timeout. Do not start the "
                                        "upgrade while check #18 reports an in-progress "
@@ -1321,7 +1321,7 @@ def _report_partial_scope(report: Report, check: str, what: str,
                        "These targets were skipped because the AWS call for them failed, so any "
                        "problem inside them would NOT appear in this check. Treat the result as "
                        "incomplete rather than as a pass, and re-run once the cause is resolved.",
-                       cols=["Target", "Error", "Detail"], rows=skipped[:50],
+                       cols=["Target", "Error", "Detail"], rows=skipped,
                        remediation="Grant the missing read permission, or re-run if the calls "
                                    "were throttled."))
 
@@ -1552,7 +1552,7 @@ def check_scp_headroom(ctx: Context, report: Report) -> None:
                            f"{len(custom_rows)} customer-managed SCP attachment(s) on governed targets",
                            "Review custom SCPs before upgrading; ensure they do not conflict "
                            "with the controls the new landing-zone version will apply.",
-                           cols=["Target", "SCP Name", "SCP Id"], rows=custom_rows[:100]))
+                           cols=["Target", "SCP Name", "SCP Id"], rows=custom_rows))
 
 
 def check_scp_blocking(ctx: Context, report: Report) -> None:
@@ -2120,6 +2120,36 @@ CHECKS = [
 # --------------------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------------------
+# Maximum table rows printed per finding. The full set is always kept on the Finding (and so
+# reaches the --json report); the console view is capped and says how many were withheld.
+_MAX_DISPLAY_ROWS = 50
+
+
+def _strip_controls(text: str, keep_newlines: bool = False) -> str:
+    """Replace C0/C1 control characters with spaces.
+
+    Resource names, OU names, SCP names and AWS error messages all reach the report from API
+    responses, and anyone with organization write access chooses those names. An embedded ANSI
+    escape or carriage return could reposition the cursor, recolour output, or forge a report
+    line - including a fake "[OK]" - so control characters never reach the terminal verbatim.
+    JSON output needs no equivalent guard: json.dump escapes control characters itself.
+    """
+    return "".join(
+        c if (keep_newlines and c == "\n")
+        else (" " if (ord(c) < 0x20 or 0x7F <= ord(c) < 0xA0) else c)
+        for c in str(text)
+    )
+
+
+def _safe_cell(value: Any) -> str:
+    """Render one table cell from possibly API-derived data.
+
+    Also replaces the column separator, so a resource name containing "|" cannot fake a column
+    break and misalign the table.
+    """
+    return _strip_controls(value).replace("|", "/")
+
+
 ICON = {BLOCKER: "[X]", WARNING: "[!]", INFO: "[i]", PASS: "[OK]", UNKNOWN: "[?]"}
 
 # ANSI colors per severity. Emitted only when writing to an interactive terminal
@@ -2175,15 +2205,20 @@ def render_text(report: Report, ctx: Context, use_color: bool = False) -> str:
         lines.append("\n" + _c(f"{ICON[level]} {level}  ({len(group)})", level, use_color, bold=True))
         lines.append("-" * 78)
         for f in group:
-            lines.append("  " + _c(f"{ICON[level]} {f.summary}", level, use_color))
+            lines.append("  " + _c(f"{ICON[level]} {_strip_controls(f.summary)}",
+                                   level, use_color))
             if f.detail:
-                lines.append(f"        {f.detail}")
+                lines.append(f"        {_strip_controls(f.detail, keep_newlines=True)}")
             if f.rows:
                 lines.append(f"        {' | '.join(f.cols)}")
-                for r in f.rows[:50]:
-                    lines.append(f"          - {' | '.join(str(x) for x in r)}")
+                for r in f.rows[:_MAX_DISPLAY_ROWS]:
+                    lines.append(f"          - {' | '.join(_safe_cell(x) for x in r)}")
+                withheld = len(f.rows) - _MAX_DISPLAY_ROWS
+                if withheld > 0:
+                    lines.append(f"          ... and {withheld} more row(s) not shown "
+                                 "(the full list is in the --json report)")
             if f.remediation:
-                lines.append(f"        FIX: {f.remediation}")
+                lines.append(f"        FIX: {_strip_controls(f.remediation)}")
             doc = f.doc or _CHECK_DOCS.get(f.check, "")
             if doc:
                 lines.append(f"        DOC: {doc}")

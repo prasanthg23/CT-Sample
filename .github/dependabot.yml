@@ -1,0 +1,15 @@
+# Keeps the pinned development / CI dependency set current.
+#
+# requirements.txt is intentionally a floor (`boto3>=1.34.0`) and needs no updates; the pinned set
+# in requirements-dev.txt is what would otherwise rot, and what dependency scanning reads.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore(deps)"
