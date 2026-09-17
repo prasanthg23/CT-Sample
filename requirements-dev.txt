@@ -22,7 +22,7 @@ jmespath==1.1.0
 python-dateutil==2.9.0.post0
 s3transfer==0.16.1
 six==1.17.0
-urllib3==1.26.20
+urllib3==2.7.0
 
 # --- test tooling (the suite also runs under plain unittest with no third-party deps) ---
 pytest==8.4.2
