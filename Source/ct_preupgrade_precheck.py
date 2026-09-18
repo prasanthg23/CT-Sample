@@ -1093,9 +1093,16 @@ def check_customizations(ctx: Context, report: Report) -> None:
 # Core Control Tower management-account service roles — required on every landing zone version.
 _CORE_MGMT_ROLES = [
     "AWSControlTowerAdmin",
-    "AWSControlTowerCloudTrailRole",
     "AWSControlTowerStackSetRole",
 ]
+# The CloudTrail service role exists only while the CloudTrail / CentralizedLogging integration is
+# enabled. It was implicit (and so always present) on landing zone 3.3 and earlier; from 4.0 the
+# integration is optional. The version alone is not enough to decide: disabling CentralizedLogging
+# on 3.3 and earlier toggled the organization trail off but RETAINED the deployed resources, while
+# on 4.0 it DELETES them. So the role is only legitimately absent on a 4.0+ landing zone whose
+# manifest explicitly disables CentralizedLogging, and only then must its absence not block.
+#   https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html
+_CLOUDTRAIL_ROLE = "AWSControlTowerCloudTrailRole"
 # The organization AWS Config aggregator role is required only on landing zone versions < 4.0.
 # In landing zone 4.0+ the AWS Config integration is optional, and the organization/account
 # aggregators (and this role) are replaced by a service-linked Config aggregator — so the role is
@@ -1104,7 +1111,7 @@ _CORE_MGMT_ROLES = [
 #   https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html
 _CONFIG_AGGREGATOR_ROLE = "AWSControlTowerConfigAggregatorRoleForOrganizations"
 # Back-compat alias: the full pre-4.0 required set.
-_REQUIRED_ROLES = _CORE_MGMT_ROLES + [_CONFIG_AGGREGATOR_ROLE]
+_REQUIRED_ROLES = _CORE_MGMT_ROLES + [_CLOUDTRAIL_ROLE, _CONFIG_AGGREGATOR_ROLE]
 
 
 def _lz_major_version(ctx: Context) -> Optional[int]:
@@ -1186,10 +1193,21 @@ def check_delegated_admins(ctx: Context, report: Report) -> None:
 def check_required_iam_roles(ctx: Context, report: Report) -> None:
     """The Control Tower management-account service roles must exist for updates/repairs.
 
-    The three core roles are required on every version. The organization Config aggregator role
-    is required only on landing zone versions < 4.0 — in 4.0+ AWS Config is optional and the
-    aggregator is service-linked, so its absence is expected and must not block (see
-    config-updates-v4 / key-changes-lz-v4)."""
+    Two roles are required on every landing zone version: AWSControlTowerAdmin and
+    AWSControlTowerStackSetRole.
+
+    Two are conditional, because landing zone 4.0 made their integrations optional, and a role
+    that is legitimately absent must never produce a BLOCKER:
+
+      * AWSControlTowerCloudTrailRole - required unless the manifest EXPLICITLY disables
+        CentralizedLogging on a 4.0+ landing zone. A pre-4.0 disable only toggled the
+        organization trail off and retained the deployed resources, so the role is still
+        expected there.
+      * AWSControlTowerConfigAggregatorRoleForOrganizations - required only below 4.0; from 4.0
+        AWS Config is optional and the aggregator is service-linked.
+
+    See config-updates-v4 / key-changes-lz-v4.
+    """
     try:
         iam = ctx.session.client("iam", region_name=ctx.region)
     except (ClientError, BotoCoreError) as e:
@@ -1197,6 +1215,18 @@ def check_required_iam_roles(ctx: Context, report: Report) -> None:
         return
     major = _lz_major_version(ctx)
     roles = list(_CORE_MGMT_ROLES)
+    # CloudTrail integration is implicit pre-4.0 and optional from 4.0, and only a 4.0+ disable
+    # actually deletes the resources. So require the role unless the manifest EXPLICITLY disables
+    # CentralizedLogging on a 4.0+ (or unknown-version) landing zone. Conservative in both
+    # directions: an absent or true `enabled` keeps the role required, and an explicit disable on
+    # a known pre-4.0 landing zone also keeps it required, because those resources were retained.
+    cl = (ctx.manifest.get("centralizedLogging")
+          or ctx.manifest.get("CentralizedLogging")
+          or {})
+    logging_disabled = cl.get("enabled") is False
+    cloudtrail_required = not (logging_disabled and (major is None or major >= 4))
+    if cloudtrail_required:
+        roles.append(_CLOUDTRAIL_ROLE)
     # Only require the org Config aggregator role on a known pre-4.0 landing zone. On 4.0+ (or an
     # unknown version, to avoid a false blocker) its absence is not treated as a problem.
     aggregator_required = major is not None and major < 4
@@ -1219,15 +1249,26 @@ def check_required_iam_roles(ctx: Context, report: Report) -> None:
                            "Control Tower cannot perform an update without these service roles.",
                            cols=["Missing role"], rows=missing,
                            remediation=f"Recreate the role(s). See {DOC}/roles-how.html"))
-    elif unknown:
+    # Reported independently of `missing`: a role that could not be checked is unverified whether
+    # or not another role is absent, and must not be dropped when a BLOCKER is also emitted.
+    if unknown:
         report.add(Finding("iam_roles", UNKNOWN,
-                           "Could not verify one or more required IAM roles",
+                           f"Could not verify {len(unknown)} required IAM role(s)",
                            ", ".join(unknown)))
-    else:
+    if not missing and not unknown:
         note = "All required Control Tower management-account roles present"
+        gated = []
+        if not cloudtrail_required:
+            gated.append(
+                f"{_CLOUDTRAIL_ROLE} not required: this landing zone "
+                f"(v{ctx.lz.get('version')}) explicitly disables CentralizedLogging, so the "
+                "CloudTrail resources are not deployed")
         if not aggregator_required:
-            note += (f" ({_CONFIG_AGGREGATOR_ROLE} not required on landing zone "
-                     f"v{ctx.lz.get('version')}: AWS Config aggregator is service-linked in v4.0+)")
+            gated.append(
+                f"{_CONFIG_AGGREGATOR_ROLE} not required on landing zone "
+                f"v{ctx.lz.get('version')}: AWS Config aggregator is service-linked in v4.0+")
+        if gated:
+            note += " (" + "; ".join(gated) + ")"
         report.add(Finding("iam_roles", PASS, note))
 
 

@@ -1328,5 +1328,88 @@ class TestReportRenderingSafety(unittest.TestCase):
         self.assertIn("line one\nline two", out)
 
 
+class TestCloudTrailRoleGating(unittest.TestCase):
+    """Sign-off condition 1: AWSControlTowerCloudTrailRole must not be required when the
+    CloudTrail / CentralizedLogging integration is legitimately disabled on a 4.0+ landing
+    zone - otherwise the tool emits a false BLOCKER telling a customer they cannot upgrade.
+
+    The gate is version AND flag, not either alone: disabling CentralizedLogging on 3.3 and
+    earlier toggled the organization trail off but retained the deployed resources, so the
+    role is still expected there.
+    """
+
+    CT_ROLE = "AWSControlTowerCloudTrailRole"
+
+    def _ctx(self, version, logging_enabled):
+        cl = {"accountId": "666666666666"}
+        if logging_enabled is not None:
+            cl["enabled"] = logging_enabled
+        return make_ctx(
+            lz={"status": "ACTIVE", "version": version, "latestAvailableVersion": "4.0",
+                "driftStatus": {"status": "IN_SYNC"}},
+            manifest={"centralizedLogging": cl})
+
+    def _run_with_missing_cloudtrail_role(self, ctx):
+        """Every role exists except AWSControlTowerCloudTrailRole."""
+        def get_role(**kw):
+            if kw.get("RoleName") == self.CT_ROLE:
+                raise ct.ClientError(
+                    {"Error": {"Code": "NoSuchEntity", "Message": "not found"}}, "GetRole")
+            return {"Role": {"RoleName": kw.get("RoleName")}}
+        iam = FakeClient(responses={"get_role": get_role})
+        ctx.session = FakeSession({"iam": iam})
+        rep = ct.Report()
+        ct.check_required_iam_roles(ctx, rep)
+        return [f.level for f in rep.findings], rep.findings
+
+    def test_v33_logging_enabled_role_required(self):
+        lv, f = self._run_with_missing_cloudtrail_role(self._ctx("3.3", True))
+        self.assertEqual(lv, [ct.BLOCKER])
+        self.assertIn(self.CT_ROLE, str(f[0].rows))
+
+    def test_v40_logging_enabled_role_required(self):
+        lv, _ = self._run_with_missing_cloudtrail_role(self._ctx("4.0", True))
+        self.assertEqual(lv, [ct.BLOCKER])
+
+    def test_v40_logging_disabled_role_not_required(self):
+        """The condition-1 case: absence is expected, so no BLOCKER."""
+        lv, f = self._run_with_missing_cloudtrail_role(self._ctx("4.0", False))
+        self.assertEqual(lv, [ct.PASS])
+        self.assertIn(self.CT_ROLE, f[0].summary)
+        self.assertIn("disables CentralizedLogging", f[0].summary)
+
+    def test_v33_logging_disabled_role_still_required(self):
+        """Pre-4.0 a disable retained the resources, so the role is still expected."""
+        lv, _ = self._run_with_missing_cloudtrail_role(self._ctx("3.3", False))
+        self.assertEqual(lv, [ct.BLOCKER])
+
+    def test_unknown_version_logging_disabled_not_required(self):
+        lv, _ = self._run_with_missing_cloudtrail_role(self._ctx("not-a-version", False))
+        self.assertEqual(lv, [ct.PASS])
+
+    def test_absent_enabled_flag_keeps_role_required(self):
+        lv, _ = self._run_with_missing_cloudtrail_role(self._ctx("4.0", None))
+        self.assertEqual(lv, [ct.BLOCKER])
+
+    def test_missing_and_unverifiable_are_both_reported(self):
+        """A role that could not be checked must not be dropped when a BLOCKER also fires."""
+        def get_role(**kw):
+            name = kw.get("RoleName")
+            if name == self.CT_ROLE:
+                raise ct.ClientError(
+                    {"Error": {"Code": "NoSuchEntity", "Message": "gone"}}, "GetRole")
+            if name == "AWSControlTowerAdmin":
+                raise ct.ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetRole")
+            return {"Role": {"RoleName": name}}
+        ctx = self._ctx("3.3", True)
+        ctx.session = FakeSession({"iam": FakeClient(responses={"get_role": get_role})})
+        rep = ct.Report()
+        ct.check_required_iam_roles(ctx, rep)
+        levels = [f.level for f in rep.findings]
+        self.assertIn(ct.BLOCKER, levels)
+        self.assertIn(ct.UNKNOWN, levels)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
