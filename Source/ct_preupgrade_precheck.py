@@ -181,6 +181,7 @@ _CHECK_DOCS = {
     "iam_roles": f"{DOC}/roles-how.html",
     "cloudtrail_role_v4": f"{DOC}/key-changes-lz-v4.html",
     "v4_integration_ou": f"{DOC}/key-changes-lz-v4.html",
+    "v4_integration_deps": f"{DOC}/lz-api-launch.html",
     "kms_key": f"{DOC}/configure-shared-accounts.html",
     "kms_policy": f"{DOC}/configure-shared-accounts.html",
     "sts_regions": f"{DOC}/troubleshooting.html",
@@ -2193,6 +2194,108 @@ def check_provisioned_product_health(ctx: Context, report: Report) -> None:
                            f"All {len(pps)} Account Factory provisioned product(s) are healthy"))
 
 
+# Landing zone 4.0 service-integration dependency rules.
+#
+# The config rule is stated in manifest terms in lz-api-launch.html "Important Notes": "If you
+# disable AWS Config integration ("config.enabled": false), you must also disable the following
+# integrations: Security Roles ("securityRoles.enabled": false), Access Management
+# ("accessManagement.enabled": false), Backup ("backup.enabled": false)."
+#
+# The securityRoles rule follows from the baseline dependency graph in key-changes-lz-v4.html,
+# where IdentityCenterBaseline, BackupAdminBaseline and BackupCentralVaultBaseline each require
+# CentralSecurityRolesBaseline to be enabled. accessManagement is the IAM Identity Center
+# integration and backup is the AWS Backup integration, so disabling securityRoles requires
+# disabling both.
+#
+# centralizedLogging is deliberately absent: LogArchiveBaseline and CentralConfigBaseline are
+# documented as independent, with no dependencies in either direction.
+#   key -> (label, integrations that must ALSO be disabled when `key` is disabled)
+_V4_INTEGRATION_DEPENDENCIES = (
+    ("config", "AWS Config", ("securityRoles", "accessManagement", "backup")),
+    ("securityRoles", "Security Roles", ("accessManagement", "backup")),
+)
+_V4_INTEGRATION_LABELS = {
+    "accessManagement": "Access Management (IAM Identity Center)",
+    "backup": "AWS Backup",
+    "centralizedLogging": "Centralized Logging",
+    "config": "AWS Config",
+    "securityRoles": "Security Roles",
+}
+
+
+def _integration_enabled(ctx: Context, key: str) -> Optional[bool]:
+    """Explicit `enabled` flag for a manifest integration: True, False, or None if absent.
+
+    None is a distinct answer and matters. Landing zone 4.0 requires an `enabled` flag on every
+    integration, but earlier manifests omit it (and omit `config` entirely), so an absent flag
+    must never be read as "disabled".
+    """
+    node = (ctx.manifest.get(key)
+            or ctx.manifest.get(key[:1].upper() + key[1:])
+            or {})
+    value = node.get("enabled")
+    return value if isinstance(value, bool) else None
+
+
+def check_v4_integration_dependencies(ctx: Context, report: Report) -> None:
+    """v4.0: a disabled service integration requires its dependents to be disabled too.
+
+    Landing zone 4.0 made every service integration individually switchable, but they are not
+    independent. lz-api-launch.html states that disabling AWS Config requires also disabling
+    Security Roles, Access Management and Backup; key-changes-lz-v4.html's baseline dependency
+    graph additionally makes Access Management and Backup depend on Security Roles. A manifest
+    holding a contradictory combination is invalid, so an update submitting it is rejected.
+
+    Only an explicit `enabled: false` triggers a rule. An absent flag is treated as "not stated"
+    rather than "disabled", because pre-4.0 manifests have no flags at all and omit `config`
+    entirely - reading absence as disabled would fire on every 3.x landing zone.
+
+    WARNING, consistent with the other two documented 4.0 prerequisite checks
+    (check_cloudtrail_role_v4_policy and check_v4_integration_accounts_same_ou). All three
+    arguably warrant BLOCKER, since each describes a condition that stops the upgrade; that is a
+    single decision about the set rather than something to change for one of them.
+    """
+    latest = _latest_major_version(ctx)
+    if latest is None or latest < 4:
+        return  # the `enabled` flags are a 4.0 concept
+
+    # Keyed by dependent so a single offending integration is reported once, even when it
+    # violates both rules (disabling config also implies securityRoles is disabled).
+    violations: Dict[str, List[str]] = {}
+    for key, label, dependents in _V4_INTEGRATION_DEPENDENCIES:
+        if _integration_enabled(ctx, key) is not False:
+            continue  # enabled, or not stated - the rule does not apply
+        for dep in dependents:
+            if _integration_enabled(ctx, dep) is True and dep not in violations:
+                violations[dep] = [f"{label} is disabled",
+                                   f"{_V4_INTEGRATION_LABELS[dep]} is still enabled",
+                                   f"set {dep}.enabled to false"]
+
+    stated = [k for k in _V4_INTEGRATION_LABELS if _integration_enabled(ctx, k) is not None]
+    if violations:
+        report.add(Finding("v4_integration_deps", WARNING,
+                           f"{len(violations)} service integration(s) enabled despite a disabled "
+                           "dependency",
+                           "Landing zone 4.0 service integrations have documented dependencies. "
+                           "This manifest holds a combination the documentation forbids, so an "
+                           "update that submits it is expected to be rejected.",
+                           cols=["Disabled", "Still enabled", "Required change"],
+                           rows=[violations[k] for k in sorted(violations)],
+                           remediation="Disable the dependent integrations, or re-enable the one "
+                                       "they depend on. Disable order is the reverse of enable "
+                                       f"order. See {DOC}/lz-api-launch.html"))
+    elif stated:
+        report.add(Finding("v4_integration_deps", PASS,
+                           f"Service-integration dependencies are consistent "
+                           f"({len(stated)} integration(s) declare an enabled flag)"))
+    else:
+        report.add(Finding("v4_integration_deps", INFO,
+                           "No service-integration enabled flags declared in the manifest",
+                           "Landing zone 4.0 requires an `enabled` flag on every integration. "
+                           "This manifest declares none, which is expected before the upgrade to "
+                           "4.0 - the flags are added as part of moving to that version."))
+
+
 def check_member_execution_roles(ctx: Context, report: Report) -> None:
     """OPT-IN (--check-member-roles): the AWSControlTowerExecution role must exist and be
     assumable in every enrolled account. A missing/modified role is 'role drift' that can make
@@ -2296,6 +2399,7 @@ CHECKS = [
     check_required_iam_roles,
     check_cloudtrail_role_v4_policy,
     check_v4_integration_accounts_same_ou,
+    check_v4_integration_dependencies,
     check_member_execution_roles,
     check_kms_key,
     check_kms_key_policy,

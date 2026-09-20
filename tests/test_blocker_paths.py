@@ -1588,5 +1588,106 @@ class TestKmsKeyRequirements(unittest.TestCase):
         self.assertIsNone(ct._arn_account(""))
 
 
+class TestV4IntegrationDependencies(unittest.TestCase):
+    """lz-api-launch.html: "If you disable AWS Config integration ("config.enabled": false), you
+    must also disable the following integrations: Security Roles, Access Management, Backup."
+    key-changes-lz-v4.html adds that IdentityCenterBaseline, BackupAdminBaseline and
+    BackupCentralVaultBaseline each require CentralSecurityRolesBaseline.
+    """
+
+    def _levels(self, manifest, version="3.3", latest="4.0"):
+        ctx = make_ctx(manifest=manifest,
+                       lz={"status": "ACTIVE", "version": version,
+                           "latestAvailableVersion": latest,
+                           "driftStatus": {"status": "IN_SYNC"}})
+        rep = ct.Report()
+        ct.check_v4_integration_dependencies(ctx, rep)
+        return {f.level for f in rep.findings}, rep.findings
+
+    def test_config_disabled_with_security_roles_enabled_warns(self):
+        lv, f = self._levels({"config": {"enabled": False},
+                              "securityRoles": {"enabled": True}})
+        self.assertEqual(lv, {ct.WARNING})
+        self.assertIn("securityRoles", str(f[0].rows))
+
+    def test_config_disabled_with_access_management_enabled_warns(self):
+        lv, f = self._levels({"config": {"enabled": False},
+                              "accessManagement": {"enabled": True}})
+        self.assertEqual(lv, {ct.WARNING})
+        self.assertIn("accessManagement", str(f[0].rows))
+
+    def test_config_disabled_with_backup_enabled_warns(self):
+        lv, _ = self._levels({"config": {"enabled": False},
+                              "backup": {"enabled": True}})
+        self.assertEqual(lv, {ct.WARNING})
+
+    def test_security_roles_disabled_with_backup_enabled_warns(self):
+        lv, _ = self._levels({"config": {"enabled": True},
+                              "securityRoles": {"enabled": False},
+                              "backup": {"enabled": True}})
+        self.assertEqual(lv, {ct.WARNING})
+
+    def test_each_offender_reported_once(self):
+        """backup violates both rules at once; it must appear a single time."""
+        lv, f = self._levels({"config": {"enabled": False},
+                              "securityRoles": {"enabled": False},
+                              "backup": {"enabled": True}})
+        self.assertEqual(lv, {ct.WARNING})
+        self.assertEqual(len(f[0].rows), 1)
+
+    def test_real_v4_manifest_passes(self):
+        """The observed 4.0 manifest: config off with every dependent off, logging on."""
+        lv, _ = self._levels({"accessManagement": {"enabled": False},
+                              "backup": {"enabled": False},
+                              "centralizedLogging": {"accountId": "555555555555",
+                                                     "enabled": True},
+                              "config": {"enabled": False},
+                              "securityRoles": {"enabled": False}},
+                             version="4.0")
+        self.assertEqual(lv, {ct.PASS})
+
+    def test_all_enabled_passes(self):
+        lv, _ = self._levels({"config": {"enabled": True},
+                              "securityRoles": {"enabled": True},
+                              "accessManagement": {"enabled": True},
+                              "backup": {"enabled": True}})
+        self.assertEqual(lv, {ct.PASS})
+
+    def test_centralized_logging_is_independent(self):
+        """LogArchiveBaseline and CentralConfigBaseline have no dependencies either way."""
+        lv, _ = self._levels({"centralizedLogging": {"enabled": False},
+                              "config": {"enabled": True},
+                              "securityRoles": {"enabled": True}})
+        self.assertEqual(lv, {ct.PASS})
+
+    def test_absent_flags_are_not_read_as_disabled(self):
+        """A 3.3 manifest has no enabled flags and no config key; nothing may fire."""
+        lv, _ = self._levels({"accessManagement": {"enabled": True},
+                              "centralizedLogging": {"accountId": "555555555555",
+                                                     "enabled": True},
+                              "securityRoles": {"accountId": "444444444444"}})
+        self.assertEqual(lv, {ct.PASS})
+
+    def test_no_flags_at_all_is_info(self):
+        lv, _ = self._levels({"securityRoles": {"accountId": "444444444444"}})
+        self.assertEqual(lv, {ct.INFO})
+
+    def test_skipped_when_4_0_not_in_play(self):
+        lv, f = self._levels({"config": {"enabled": False},
+                              "backup": {"enabled": True}},
+                             version="3.2", latest="3.3")
+        self.assertEqual(f, [])
+        self.assertEqual(lv, set())
+
+    def test_integration_enabled_helper(self):
+        ctx = make_ctx(manifest={"config": {"enabled": False},
+                                 "securityRoles": {"accountId": "444444444444"},
+                                 "backup": {"enabled": True}})
+        self.assertIs(ct._integration_enabled(ctx, "config"), False)
+        self.assertIs(ct._integration_enabled(ctx, "backup"), True)
+        self.assertIsNone(ct._integration_enabled(ctx, "securityRoles"))
+        self.assertIsNone(ct._integration_enabled(ctx, "accessManagement"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
