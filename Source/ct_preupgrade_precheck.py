@@ -182,6 +182,7 @@ _CHECK_DOCS = {
     "cloudtrail_role_v4": f"{DOC}/key-changes-lz-v4.html",
     "v4_integration_ou": f"{DOC}/key-changes-lz-v4.html",
     "v4_integration_deps": f"{DOC}/lz-api-launch.html",
+    "identity_center": f"{DOC}/getting-started-prereqs.html",
     "kms_key": f"{DOC}/configure-shared-accounts.html",
     "kms_policy": f"{DOC}/configure-shared-accounts.html",
     "sts_regions": f"{DOC}/troubleshooting.html",
@@ -2296,6 +2297,91 @@ def check_v4_integration_dependencies(ctx: Context, report: Report) -> None:
                            "4.0 - the flags are added as part of moving to that version."))
 
 
+def check_identity_center_region(ctx: Context, report: Report) -> None:
+    """Documented prerequisite: IAM Identity Center must live in the landing zone's home Region.
+
+    getting-started-prereqs.html: "If AWS IAM Identity Center (IAM Identity Center) is already set
+    up, the AWS Control Tower home Region must be the same as the IAM Identity Center Region.
+    However, if IAM Identity Center is set up in the US East (N. Virginia) Region (us-east-1),
+    AWS Control Tower uses that instance regardless of the home Region you select." Prerequisites
+    matter for an update, not only a first launch: "A landing zone update must meet the same
+    prerequisites as a landing zone setup" (troubleshooting.html).
+
+    ListInstances is regional and returns an instance only in the Region where Identity Center is
+    deployed, so alignment is established by where the call succeeds. us-east-1 is never reported
+    as a mismatch because the documentation explicitly exempts it.
+
+    Absence is not a finding. An organization with no Identity Center instance is a valid
+    configuration and the prerequisite simply does not apply, so "not found" is INFO rather than a
+    warning - and deliberately not UNKNOWN, which fails closed by default and would gate every
+    landing zone that does not use Identity Center.
+    """
+    if _integration_enabled(ctx, "accessManagement") is False:
+        report.add(Finding("identity_center", INFO,
+                           "Access Management integration is disabled; Identity Center Region "
+                           "alignment not applicable",
+                           "The manifest sets accessManagement.enabled to false, so Control Tower "
+                           "does not manage IAM Identity Center for this landing zone."))
+        return
+
+    # Home Region first, then the documented us-east-1 exemption, then the remaining governed
+    # Regions - finding an instance in one of those is the only way to prove a real mismatch.
+    order = [ctx.region]
+    if ctx.region != "us-east-1":
+        order.append("us-east-1")
+    order += [r for r in (ctx.governed_regions or []) if r not in order]
+
+    errors: List[List[str]] = []
+    for region in order:
+        try:
+            sso = ctx.session.client("sso-admin", region_name=region)
+            instances = sso.list_instances().get("Instances", [])
+        except (ClientError, BotoCoreError) as e:
+            errors.append([region, _error_code(e), _skip_note(e)])
+            continue
+        if not instances:
+            continue
+        if region == ctx.region:
+            report.add(Finding("identity_center", PASS,
+                               "IAM Identity Center is in the landing zone home Region "
+                               f"({ctx.region})"))
+            return
+        if region == "us-east-1":
+            report.add(Finding("identity_center", PASS,
+                               "IAM Identity Center is in us-east-1, which Control Tower uses "
+                               f"regardless of the home Region ({ctx.region})",
+                               "Documented exemption: Control Tower uses an Identity Center "
+                               "instance in us-east-1 whatever home Region you select."))
+            return
+        report.add(Finding("identity_center", WARNING,
+                           f"IAM Identity Center is in {region}, not the home Region "
+                           f"({ctx.region})",
+                           "The home Region must match the Identity Center Region. Only us-east-1 "
+                           "is exempt. Identity Center can be installed only in the management "
+                           "account of the organization.",
+                           cols=["Identity Center Region", "Landing zone home Region"],
+                           rows=[[region, ctx.region]],
+                           remediation="Align the Regions before updating. See "
+                                       f"{DOC}/getting-started-prereqs.html"))
+        return
+
+    if errors and len(errors) == len(order):
+        report.add(Finding("identity_center", UNKNOWN,
+                           "Could not determine the IAM Identity Center Region",
+                           "Every ListInstances call failed, so alignment with the home Region is "
+                           "unverified.",
+                           cols=["Region", "Error", "Detail"], rows=errors))
+        return
+    report.add(Finding("identity_center", INFO,
+                       "No IAM Identity Center instance found in the home Region, us-east-1, or "
+                       "any governed Region",
+                       "An organization without Identity Center is a valid configuration and this "
+                       "prerequisite does not apply to it. If Identity Center IS set up in some "
+                       f"other Region, it must match the home Region ({ctx.region}) - only "
+                       "us-east-1 is exempt." + _scope_suffix(errors),
+                       cols=["Region", "Error", "Detail"], rows=errors or None))
+
+
 def check_member_execution_roles(ctx: Context, report: Report) -> None:
     """OPT-IN (--check-member-roles): the AWSControlTowerExecution role must exist and be
     assumable in every enrolled account. A missing/modified role is 'role drift' that can make
@@ -2400,6 +2486,7 @@ CHECKS = [
     check_cloudtrail_role_v4_policy,
     check_v4_integration_accounts_same_ou,
     check_v4_integration_dependencies,
+    check_identity_center_region,
     check_member_execution_roles,
     check_kms_key,
     check_kms_key_policy,

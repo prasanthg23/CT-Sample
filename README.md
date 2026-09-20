@@ -99,6 +99,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 21 | Upgrade-path considerations | Version-specific changes on the path from the deployed version to the target. For 4.0: the CloudTrail managed-policy prerequisite, the Security OU no longer being created, integrations becoming optional with baseline dependencies, the AWS Config scope change, drift notifications moving to EventBridge, and `CentralizedLogging` disable deleting logging-account resources | Version comparison only — no additional API calls | INFO |
 | 22 | Service-integration accounts share one parent OU | Landing zone 4.0 [requires all accounts configured for each service integration to be under the same parent OU](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html) — that OU becomes the designated Security OU, so a split across OUs is an unsupported layout. Evaluated when 4.0+ is deployed or available; explicitly disabled integrations are skipped, since a disabled integration names no account to place | `organizations:ListParents` | WARNING |
 | 23 | Service-integration dependencies | Landing zone 4.0 integrations are individually switchable but not independent. [Disabling AWS Config requires also disabling Security Roles, Access Management and Backup](https://docs.aws.amazon.com/controltower/latest/userguide/lz-api-launch.html), and the [baseline dependency graph](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html) additionally makes Access Management and Backup depend on Security Roles. A contradictory manifest is rejected. `centralizedLogging` is independent in both directions. Only an explicit `enabled: false` triggers a rule, so a pre-4.0 manifest with no flags never fires | Manifest only — no API call | WARNING |
+| 24 | IAM Identity Center Region | The [documented prerequisite](https://docs.aws.amazon.com/controltower/latest/userguide/getting-started-prereqs.html) that Identity Center sits in the landing zone home Region, and prerequisites apply to an update as well as a launch. `us-east-1` is never flagged — Control Tower uses an instance there regardless of home Region. Searches the home Region, then `us-east-1`, then the remaining governed Regions; finding the instance elsewhere is the only proof of a real mismatch. No instance anywhere is INFO, not a finding, since an organization without Identity Center is valid | `sso:ListInstances` (per Region) | WARNING |
 
 **Opt-in deeper checks** (off by default — slower or heuristic; enable with a flag):
 
@@ -162,6 +163,7 @@ If it does not, the tool emits a WARNING (not a blocker).
           "cloudformation:ListStackInstances",
           "cloudformation:ListStacks",
           "cloudformation:ListStackSetOperations",
+          "sso:ListInstances",
           "sts:GetCallerIdentity"
         ],
         "Resource": "*"

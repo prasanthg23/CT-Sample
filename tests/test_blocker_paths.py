@@ -1689,5 +1689,76 @@ class TestV4IntegrationDependencies(unittest.TestCase):
         self.assertIsNone(ct._integration_enabled(ctx, "accessManagement"))
 
 
+class TestIdentityCenterRegion(unittest.TestCase):
+    """getting-started-prereqs.html: "If AWS IAM Identity Center is already set up, the AWS Control
+    Tower home Region must be the same as the IAM Identity Center Region. However, if IAM Identity
+    Center is set up in the US East (N. Virginia) Region (us-east-1), AWS Control Tower uses that
+    instance regardless of the home Region you select."
+    """
+
+    INSTANCE = {"Instances": [{"InstanceArn": "arn:aws:sso:::instance/ssoins-abc123",
+                               "IdentityStoreId": "d-abc123"}]}
+
+    def _run(self, present_in, home="us-east-1", governed=None, manifest=None, errors_in=()):
+        """present_in: regions where ListInstances returns an instance."""
+        class RegionalSession:
+            def __init__(self, outer):
+                self.outer = outer
+            def client(self, service, region_name=None, **kw):
+                if service != "sso-admin":
+                    return FakeClient()
+                if region_name in errors_in:
+                    return FakeClient(errors={"list_instances": client_error(
+                        "AccessDeniedException", "ListInstances")})
+                body = self.outer.INSTANCE if region_name in present_in else {"Instances": []}
+                return FakeClient({"list_instances": body})
+        ctx = make_ctx(manifest=manifest if manifest is not None else {},
+                       governed_regions=governed if governed is not None else [home])
+        ctx.region = home
+        ctx.session = RegionalSession(self)
+        rep = ct.Report()
+        ct.check_identity_center_region(ctx, rep)
+        return {f.level for f in rep.findings}, rep.findings
+
+    def test_aligned_with_home_region_passes(self):
+        lv, f = self._run(present_in={"eu-west-1"}, home="eu-west-1", governed=["eu-west-1"])
+        self.assertEqual(lv, {ct.PASS})
+        self.assertIn("home Region", f[0].summary)
+
+    def test_us_east_1_is_exempt(self):
+        """Home is eu-west-1 but Identity Center is in us-east-1 - documented as acceptable."""
+        lv, f = self._run(present_in={"us-east-1"}, home="eu-west-1", governed=["eu-west-1"])
+        self.assertEqual(lv, {ct.PASS})
+        self.assertIn("us-east-1", f[0].summary)
+
+    def test_real_mismatch_warns(self):
+        lv, f = self._run(present_in={"ap-south-1"}, home="eu-west-1",
+                          governed=["eu-west-1", "ap-south-1"])
+        self.assertEqual(lv, {ct.WARNING})
+        self.assertIn("ap-south-1", f[0].summary)
+
+    def test_absent_everywhere_is_info_not_unknown(self):
+        """UNKNOWN fails closed by default, so absence must not gate the upgrade."""
+        lv, _ = self._run(present_in=set(), home="eu-west-1", governed=["eu-west-1"])
+        self.assertEqual(lv, {ct.INFO})
+
+    def test_access_management_disabled_skips(self):
+        lv, f = self._run(present_in={"ap-south-1"}, home="eu-west-1",
+                          governed=["eu-west-1", "ap-south-1"],
+                          manifest={"accessManagement": {"enabled": False}})
+        self.assertEqual(lv, {ct.INFO})
+        self.assertIn("not applicable", f[0].summary)
+
+    def test_all_calls_failing_is_unknown(self):
+        lv, _ = self._run(present_in=set(), home="eu-west-1", governed=["eu-west-1"],
+                          errors_in=("eu-west-1", "us-east-1"))
+        self.assertEqual(lv, {ct.UNKNOWN})
+
+    def test_home_region_not_probed_twice_when_us_east_1(self):
+        lv, f = self._run(present_in={"us-east-1"}, home="us-east-1", governed=["us-east-1"])
+        self.assertEqual(lv, {ct.PASS})
+        self.assertIn("home Region", f[0].summary)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
