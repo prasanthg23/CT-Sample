@@ -1572,7 +1572,7 @@ class TestKmsKeyRequirements(unittest.TestCase):
 
     def test_all_problems_reported_together(self):
         lv, f = self._levels(KeyState="Disabled", MultiRegion=True, KeySpec="RSA_4096",
-                             Arn="arn:aws:kms:us-east-1:999999999999:key/x")
+                             Arn=kms_arn("999999999999", key_id="x"))
         self.assertEqual(lv, {ct.BLOCKER})
         self.assertEqual(len(f[0].rows), 4)
 
