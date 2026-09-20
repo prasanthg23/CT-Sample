@@ -1396,6 +1396,18 @@ _V4_INTEGRATIONS = (
 _BASELINE_EXPECTED_ABSENT = ("NOT_APPLICABLE", "NOT_ENABLED")
 
 
+def _arn_account(arn: str) -> Optional[str]:
+    """Account-id field of an ARN, or None if it is absent or not a well-formed account id.
+
+    Returning None on anything unparseable matters: callers compare this against the management
+    account, and a partial read must not be turned into a confident mismatch.
+    """
+    parts = str(arn or "").split(":")
+    if len(parts) > 5 and parts[4].isdigit() and len(parts[4]) == 12:
+        return parts[4]
+    return None
+
+
 def _target_account_id(target: str) -> Optional[str]:
     """Account id for an Organizations account target, or None for an OU / root target.
 
@@ -1553,8 +1565,17 @@ def check_v4_integration_accounts_same_ou(ctx: Context, report: Report) -> None:
 
 
 def check_kms_key(ctx: Context, report: Report) -> None:
-    """If the landing zone uses a customer-managed KMS key, it must be ENABLED (not disabled
-    or pending deletion)."""
+    """Validate the landing zone's customer-managed KMS key against Control Tower's own pre-check.
+
+    configure-kms-keys.html: "AWS Control Tower performs a pre-check to validate your KMS key.
+    The key must meet these requirements: Enabled / Symmetric / Not a multi-Region key / Has
+    correct permissions added to the policy / Key is in the management account." The same page
+    states plainly that "AWS Control Tower does not support multi-Region keys or asymmetric keys".
+
+    Four of those five are decided by the single kms:DescribeKey response this check already
+    makes, so all four are validated here. The fifth, the key policy, needs kms:GetKeyPolicy and
+    is handled by check_kms_key_policy behind --check-kms-policy.
+    """
     if not ctx.kms_key_arn:
         report.add(Finding("kms_key", INFO,
                            "No customer-managed KMS key referenced in the landing zone manifest",
@@ -1570,16 +1591,41 @@ def check_kms_key(ctx: Context, report: Report) -> None:
                            remediation="Ensure the key exists and the precheck role has "
                                        "kms:DescribeKey."))
         return
+
+    problems: List[List[str]] = []
     state = meta.get("KeyState")
-    if state == "Enabled":
-        extra = " (multi-Region)" if meta.get("MultiRegion") else ""
-        report.add(Finding("kms_key", PASS, f"Landing zone KMS key is Enabled{extra}"))
-    else:
+    if state != "Enabled":
+        problems.append(["Enabled", f"KeyState is {state}"])
+    # Asymmetric keys are unsupported. KeySpec is current; CustomerMasterKeySpec is the older name.
+    spec = meta.get("KeySpec") or meta.get("CustomerMasterKeySpec") or ""
+    usage = meta.get("KeyUsage") or ""
+    if spec and spec != "SYMMETRIC_DEFAULT":
+        problems.append(["Symmetric", f"KeySpec is {spec}"])
+    elif usage and usage != "ENCRYPT_DECRYPT":
+        problems.append(["Symmetric", f"KeyUsage is {usage}"])
+    if meta.get("MultiRegion") is True:
+        problems.append(["Not a multi-Region key", "MultiRegion is true"])
+    key_account = _arn_account(meta.get("Arn") or ctx.kms_key_arn)
+    if key_account and ctx.mgmt_account and key_account != ctx.mgmt_account:
+        problems.append(["Key is in the management account",
+                         f"key is in account {key_account}, management account is "
+                         f"{ctx.mgmt_account}"])
+
+    if problems:
         report.add(Finding("kms_key", BLOCKER,
-                           f"Landing zone KMS key is not usable (state: {state})",
-                           f"{ctx.kms_key_arn}",
-                           remediation="Re-enable the key (or cancel deletion) before upgrading. "
-                                       "A disabled/pending-deletion key fails the update."))
+                           f"Landing zone KMS key fails {len(problems)} of Control Tower's "
+                           "documented key requirements",
+                           f"{ctx.kms_key_arn} does not satisfy Control Tower's KMS pre-check, so "
+                           "a landing-zone operation using this key is expected to fail. Control "
+                           "Tower does not support asymmetric or multi-Region keys at all.",
+                           cols=["Requirement not met", "Observed"], rows=problems,
+                           remediation="Re-enable the key or cancel its deletion; otherwise "
+                                       "generate a symmetric, single-Region key in the management "
+                                       f"account and select it. See {DOC}/configure-kms-keys.html"))
+    else:
+        report.add(Finding("kms_key", PASS,
+                           "Landing zone KMS key meets Control Tower's requirements "
+                           "(enabled, symmetric, single-Region, in the management account)"))
 
 
 def check_sts_regional_activation(ctx: Context, report: Report) -> None:

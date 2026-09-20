@@ -644,8 +644,11 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_kms_key, ctx)))
 
     def test_kms_enabled_passes(self):
-        kms = FakeClient({"describe_key": {"KeyMetadata": {"KeyState": "Enabled"}}})
-        ctx = make_ctx(kms_key_arn="arn:aws:kms:us-east-1:1:key/abc")
+        kms = FakeClient({"describe_key": {"KeyMetadata": {
+            "KeyState": "Enabled", "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT", "MultiRegion": False,
+            "Arn": "arn:aws:kms:us-east-1:111111111111:key/abc"}}})
+        ctx = make_ctx(kms_key_arn="arn:aws:kms:us-east-1:111111111111:key/abc")
         ctx.session._clients["kms"] = kms
         self.assertIn(ct.PASS, levels(_run(ct.check_kms_key, ctx)))
 
@@ -1497,6 +1500,81 @@ class TestBaselineSeverityByTarget(unittest.TestCase):
         """StackSet presence is the wrong proxy for the role; it can be deleted with stacks
         retained. check_member_execution_roles tests the role directly instead."""
         self.assertNotIn("AWSControlTowerExecutionRole", ct._EXPECTED_STACKSETS)
+
+
+class TestKmsKeyRequirements(unittest.TestCase):
+    """configure-kms-keys.html: Control Tower pre-checks the key against five requirements -
+    Enabled, Symmetric, Not a multi-Region key, correct key policy, and Key is in the management
+    account - and "does not support multi-Region keys or asymmetric keys". Four are decided by
+    the kms:DescribeKey response this check already makes.
+    """
+
+    ARN = "arn:aws:kms:us-east-1:111111111111:key/abcd-1234"
+
+    def _levels(self, **meta):
+        md = {"KeyState": "Enabled", "KeySpec": "SYMMETRIC_DEFAULT",
+              "KeyUsage": "ENCRYPT_DECRYPT", "MultiRegion": False, "Arn": self.ARN}
+        md.update(meta)
+        kms = FakeClient({"describe_key": {"KeyMetadata": md}})
+        ctx = make_ctx({"kms": kms}, kms_key_arn=md["Arn"])
+        rep = ct.Report()
+        ct.check_kms_key(ctx, rep)
+        return {f.level for f in rep.findings}, rep.findings
+
+    def test_compliant_key_passes(self):
+        lv, _ = self._levels()
+        self.assertEqual(lv, {ct.PASS})
+
+    def test_disabled_key_blocks(self):
+        lv, f = self._levels(KeyState="Disabled")
+        self.assertEqual(lv, {ct.BLOCKER})
+        self.assertIn("Enabled", str(f[0].rows))
+
+    def test_pending_deletion_blocks(self):
+        lv, _ = self._levels(KeyState="PendingDeletion")
+        self.assertEqual(lv, {ct.BLOCKER})
+
+    def test_multi_region_key_blocks(self):
+        """Regression: a multi-Region key previously reported PASS with a cosmetic
+        '(multi-Region)' label, although Control Tower does not support such keys."""
+        lv, f = self._levels(MultiRegion=True)
+        self.assertEqual(lv, {ct.BLOCKER})
+        self.assertIn("multi-Region", str(f[0].rows))
+
+    def test_asymmetric_key_blocks(self):
+        lv, f = self._levels(KeySpec="RSA_4096", KeyUsage="ENCRYPT_DECRYPT")
+        self.assertEqual(lv, {ct.BLOCKER})
+        self.assertIn("Symmetric", str(f[0].rows))
+
+    def test_sign_verify_key_blocks(self):
+        lv, _ = self._levels(KeySpec="", KeyUsage="SIGN_VERIFY")
+        self.assertEqual(lv, {ct.BLOCKER})
+
+    def test_legacy_spec_field_honoured(self):
+        lv, _ = self._levels(KeySpec="", CustomerMasterKeySpec="RSA_2048")
+        self.assertEqual(lv, {ct.BLOCKER})
+
+    def test_key_outside_management_account_blocks(self):
+        lv, f = self._levels(Arn="arn:aws:kms:us-east-1:999999999999:key/abcd-1234")
+        self.assertEqual(lv, {ct.BLOCKER})
+        self.assertIn("management account", str(f[0].rows))
+
+    def test_all_problems_reported_together(self):
+        lv, f = self._levels(KeyState="Disabled", MultiRegion=True, KeySpec="RSA_4096",
+                             Arn="arn:aws:kms:us-east-1:999999999999:key/x")
+        self.assertEqual(lv, {ct.BLOCKER})
+        self.assertEqual(len(f[0].rows), 4)
+
+    def test_no_key_configured_is_info(self):
+        ctx = make_ctx({"kms": FakeClient()}, kms_key_arn=None)
+        rep = ct.Report()
+        ct.check_kms_key(ctx, rep)
+        self.assertEqual({f.level for f in rep.findings}, {ct.INFO})
+
+    def test_arn_account_parsing(self):
+        self.assertEqual(ct._arn_account(self.ARN), "111111111111")
+        self.assertIsNone(ct._arn_account("not-an-arn"))
+        self.assertIsNone(ct._arn_account(""))
 
 
 if __name__ == "__main__":
