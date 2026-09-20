@@ -169,8 +169,10 @@ class TestBlockerPaths(unittest.TestCase):
 
     # 7. enabled baselines drift/failed --------------------------------------------
     def test_enabled_baselines_failed_blocks(self):
+        # On a service-integration account (Audit), which a landing-zone update acts on.
         ctl = FakeClient({"list_enabled_baselines": {"enabledBaselines": [
-            {"targetIdentifier": "arn:acct", "baselineVersion": "4.0",
+            {"targetIdentifier": "arn:aws:organizations::111111111111:account/o-a/444444444444",
+             "baselineVersion": "4.0",
              "statusSummary": {"status": "FAILED"}}]}})
         ctx = make_ctx({"controltower": ctl})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_enabled_baselines, ctx)))
@@ -1409,6 +1411,88 @@ class TestCloudTrailRoleGating(unittest.TestCase):
         levels = [f.level for f in rep.findings]
         self.assertIn(ct.BLOCKER, levels)
         self.assertIn(ct.UNKNOWN, levels)
+
+
+class TestBaselineSeverityByTarget(unittest.TestCase):
+    """A landing-zone update acts on the management and service-integration accounts. Enrolled
+    accounts are updated separately: "When you perform a landing zone update, you must update
+    your enrolled accounts to apply new controls to those accounts" (update-existing-accounts).
+    Account baseline drift is repairable drift, fixed by updating the account. So an unhealthy
+    baseline on a member account or OU must NOT fail the whole precheck.
+    """
+
+    ARN = "arn:aws:organizations::111111111111:account/o-abc123/%s"
+    OU_ARN = "arn:aws:organizations::111111111111:ou/o-abc123/ou-ab12-cdefghij"
+
+    def _levels(self, target, status="FAILED", drift=None):
+        b = {"targetIdentifier": target, "baselineVersion": "4.0",
+             "statusSummary": {"status": status}}
+        if drift:
+            b["driftStatusSummary"] = {"driftStatus": drift}
+        ctl = FakeClient({"list_enabled_baselines": {"enabledBaselines": [b]}})
+        return levels(_run(ct.check_enabled_baselines, make_ctx({"controltower": ctl})))
+
+    def test_audit_account_blocks(self):
+        self.assertIn(ct.BLOCKER, self._levels(self.ARN % "444444444444"))
+
+    def test_log_archive_account_blocks(self):
+        self.assertIn(ct.BLOCKER, self._levels(self.ARN % "555555555555"))
+
+    def test_management_account_blocks(self):
+        self.assertIn(ct.BLOCKER, self._levels(self.ARN % "111111111111"))
+
+    def test_member_account_warns_not_blocks(self):
+        """The observed real case: a test account parked in an unmanaged OU reported FAILED,
+        which previously failed an otherwise healthy landing zone with exit 2."""
+        lv = self._levels(self.ARN % "994180630136")
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_ou_target_warns_not_blocks(self):
+        lv = self._levels(self.OU_ARN)
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_member_drift_warns_not_blocks(self):
+        lv = self._levels(self.ARN % "994180630136", status="SUCCEEDED", drift="DRIFTED")
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_integration_account_drift_still_blocks(self):
+        self.assertIn(ct.BLOCKER,
+                      self._levels(self.ARN % "444444444444",
+                                   status="SUCCEEDED", drift="DRIFTED"))
+
+    def test_not_applicable_and_not_enabled_are_expected(self):
+        """4.0: the CT and Config baselines are not applicable to the Security OU and the
+        service-integration accounts, and that status is expected - never a finding."""
+        for status in ("NOT_APPLICABLE", "Not Applicable", "NOT_ENABLED", "Not Enabled"):
+            self.assertEqual(self._levels(self.ARN % "444444444444", status=status),
+                             {ct.PASS}, f"{status!r} should be treated as expected")
+
+    def test_healthy_passes(self):
+        self.assertEqual(self._levels(self.ARN % "444444444444", status="SUCCEEDED"), {ct.PASS})
+
+    def test_mixed_targets_report_separately(self):
+        ctl = FakeClient({"list_enabled_baselines": {"enabledBaselines": [
+            {"targetIdentifier": self.ARN % "444444444444", "baselineVersion": "4.0",
+             "statusSummary": {"status": "FAILED"}},
+            {"targetIdentifier": self.ARN % "994180630136", "baselineVersion": "4.0",
+             "statusSummary": {"status": "FAILED"}}]}})
+        lv = levels(_run(ct.check_enabled_baselines, make_ctx({"controltower": ctl})))
+        self.assertEqual(lv, {ct.BLOCKER, ct.WARNING})
+
+    def test_target_account_id_parsing(self):
+        self.assertEqual(ct._target_account_id(self.ARN % "123456789012"), "123456789012")
+        self.assertEqual(ct._target_account_id("123456789012"), "123456789012")
+        self.assertIsNone(ct._target_account_id(self.OU_ARN))
+        self.assertIsNone(ct._target_account_id("arn:acct"))
+        self.assertIsNone(ct._target_account_id(""))
+
+    def test_execution_role_stackset_no_longer_asserted(self):
+        """StackSet presence is the wrong proxy for the role; it can be deleted with stacks
+        retained. check_member_execution_roles tests the role directly instead."""
+        self.assertNotIn("AWSControlTowerExecutionRole", ct._EXPECTED_STACKSETS)
 
 
 if __name__ == "__main__":

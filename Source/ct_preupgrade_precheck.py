@@ -483,9 +483,10 @@ _VERSION_CONSIDERATIONS = [
          "only. To deploy Config (recorder + delivery channel) to member accounts, enable the Config "
          "baseline on each managed OU. LZ-level Config is a prerequisite for the OU Config baseline."),
         ("Drift notifications move to Amazon EventBridge",
-         "For 4.0 landing zones without AWSControlTowerBaseline enabled, Control Tower stops sending "
-         "drift notifications to the SNS topic and sends them to EventBridge in the management account. "
-         "Update any consumers that watched the SNS topic."),
+         "Control Tower stops sending drift notifications to the SNS topic for ALL customers on "
+         "landing zone 4.0 and later, and sends them to EventBridge in the management account "
+         "instead. Create an EventBridge rule in the management account and update any consumers "
+         "that watched the SNS topic."),
         ("CentralizedLogging disable now DELETES logging-account resources",
          "In 3.3 and earlier, disabling CentralizedLogging toggled the org CloudTrail off but kept "
          "resources. In 4.0, disabling it deletes the Config Recorder, Delivery Channel, and "
@@ -666,6 +667,25 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
 
 
 def check_enabled_baselines(ctx: Context, report: Report) -> None:
+    """Enabled baselines must be healthy - but severity depends on WHICH target is unhealthy.
+
+    A landing-zone update acts on the management account and the service-integration (Audit /
+    Log archive) accounts. It does NOT update enrolled accounts: "When you perform a landing zone
+    update, you must update your enrolled accounts to apply new controls to those accounts"
+    (update-existing-accounts.html) - that is a separate Re-register / Reset step per OU. Account
+    baseline drift is also classified as repairable drift, resolved by updating the account,
+    rather than something that must be cleared before a landing-zone update.
+
+    So an unhealthy baseline on a service-integration account BLOCKS the update, while one on a
+    member account or OU is a WARNING to resolve during the account-update phase that follows.
+    Treating every target as a blocker fails a whole landing zone over, for example, one test
+    account parked in an unmanaged OU.
+
+    NOT_APPLICABLE / NOT_ENABLED are expected, not failures: in landing zone 4.0 the Control Tower
+    and Config baselines "are not applicable to the Security OU and the service integration
+    accounts ... This status is expected", and a service-integration account whose integration is
+    disabled reports Not Enabled by design (key-changes-lz-v4.html).
+    """
     try:
         baselines = _collect(ctx.ct, "list_enabled_baselines", "enabledBaselines",
                              includeChildren=True)
@@ -673,33 +693,54 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
         report.add(Finding("baselines_drift", UNKNOWN,
                            "Could not list enabled baselines", str(e)))
         return
-    bad = []
+    # The accounts a landing-zone update actually acts on. Mirrors check_stacksets.
+    shared = {a for a in (ctx.mgmt_account, ctx.audit_account, ctx.log_archive_account) if a}
+    shared_bad: List[List[str]] = []
+    member_bad: List[List[str]] = []
     no_status: List[List[str]] = []
     for b in baselines:
         st = (b.get("statusSummary") or {}).get("status")
         ds = (b.get("driftStatusSummary") or {}).get("driftStatus")
         tgt = b.get("targetIdentifier", b.get("arn", ""))
-        if st and st not in ("SUCCEEDED",):
-            bad.append([tgt, b.get("baselineVersion", ""), st or "", ds or ""])
-        elif ds == "DRIFTED":
-            bad.append([tgt, b.get("baselineVersion", ""), st or "", ds])
-        elif not st:
+        ver = b.get("baselineVersion", "")
+        if not st:
             # A missing statusSummary is not evidence of health.
-            no_status.append([tgt, b.get("baselineVersion", ""), "absent", ds or ""])
+            no_status.append([tgt, ver, "absent", ds or ""])
+            continue
+        if str(st).replace(" ", "_").upper() in _BASELINE_EXPECTED_ABSENT:
+            continue  # expected on the Security OU / a disabled service integration
+        if str(st).upper() != "SUCCEEDED" or ds == "DRIFTED":
+            acct = _target_account_id(tgt)
+            row = [tgt, ver, str(st), ds or ""]
+            (shared_bad if acct and acct in shared else member_bad).append(row)
     if no_status:
         report.add(Finding("baselines_drift", UNKNOWN,
                            f"{len(no_status)} enabled baseline(s) reported no status",
                            "Control Tower returned no statusSummary for these baselines, so "
                            "their state is unverified. They are NOT counted as healthy.",
                            cols=["Target", "Version", "Status", "Drift"], rows=no_status))
-    if bad:
+    if shared_bad:
         report.add(Finding("baselines_drift", BLOCKER,
-                           f"{len(bad)} enabled baseline(s) drifted or not SUCCEEDED",
-                           "Baselines (incl. child accounts) must be healthy; drifted/failed "
-                           "baselines cause enrollment and update problems.",
-                           cols=["Target", "Version", "Status", "Drift"], rows=bad,
-                           remediation="reset-enabled-baseline / re-register OU."))
-    else:
+                           f"{len(shared_bad)} baseline(s) unhealthy on a service-integration "
+                           "account",
+                           "A landing-zone update acts on the management and service-integration "
+                           "(Audit / Log archive) accounts, so an unhealthy baseline on one of "
+                           "them must be resolved before updating.",
+                           cols=["Target", "Version", "Status", "Drift"], rows=shared_bad,
+                           remediation="Reset the landing zone, or reset the enabled baseline on "
+                                       f"the affected target. See {DOC}/resolve-drift.html"))
+    if member_bad:
+        report.add(Finding("baselines_drift", WARNING,
+                           f"{len(member_bad)} baseline(s) unhealthy on a member account or OU",
+                           "A landing-zone update does not update enrolled accounts, so this does "
+                           "not block the update itself. It is repairable drift that must still be "
+                           "resolved in the account-update phase that follows, or those accounts "
+                           "will not receive the new controls.",
+                           cols=["Target", "Version", "Status", "Drift"], rows=member_bad,
+                           remediation="Update the account for account-level drift, or re-register "
+                                       "the OU for OU-level drift. See "
+                                       f"{DOC}/update-existing-accounts.html"))
+    if not shared_bad and not member_bad:
         report.add(Finding("baselines_drift", PASS,
                            f"All {len(baselines)} enabled baselines SUCCEEDED / IN_SYNC"
                            f"{_scope_suffix(no_status)}"))
@@ -758,7 +799,8 @@ def check_stacksets(ctx: Context, report: Report) -> None:
             if is_bad:
                 (shared_bad if acct in shared else member_bad).append(row)
             elif status == "OUTDATED":
-                # Expected when an LZ update is pending — the update refreshes these.
+                # Behind the current template. NOT refreshed by the landing-zone update itself —
+                # enrolled accounts are updated separately, by re-registering/resetting the OU.
                 outdated.append(row)
     _report_partial_scope(report, "stacksets", "AWSControlTower StackSet(s)", skipped)
     if shared_bad:
@@ -795,9 +837,12 @@ def check_stacksets(ctx: Context, report: Report) -> None:
         if outdated:
             report.add(Finding("stacksets", INFO,
                                f"{len(outdated)} StackSet instance(s) are OUTDATED (expected)",
-                               "OUTDATED means the instances are behind the current template — this is "
-                               "normal when a landing-zone update is pending, and the update will "
-                               "refresh them. No inoperable/failed/drifted instances were found.",
+                               "OUTDATED means the instances are behind the current template. A "
+                               "landing-zone update does NOT refresh them: \"When you perform a "
+                               "landing-zone update, you must update your enrolled accounts to "
+                               "apply new controls to those accounts.\" Re-register or reset each "
+                               "registered OU after the update, or those accounts keep the old "
+                               "template. No inoperable/failed/drifted instances were found.",
                                cols=["StackSet", "Account", "Region", "Status", "Drift"],
                                rows=outdated))
         elif not orphaned:
@@ -1321,6 +1366,33 @@ _V4_INTEGRATIONS = (
 )
 
 
+# Baseline statuses that are EXPECTED rather than failures. In landing zone 4.0 the Control Tower
+# Baseline and the AWS Config Baseline "are not applicable to the Security OU and the service
+# integration accounts. The Security OU displays a baseline status of 'Not Applicable' ... This
+# status is expected." A service-integration account whose integration is disabled likewise
+# reports Not Enabled by design, and Control Tower no longer manages it.
+#   https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html
+_BASELINE_EXPECTED_ABSENT = ("NOT_APPLICABLE", "NOT_ENABLED")
+
+
+def _target_account_id(target: str) -> Optional[str]:
+    """Account id for an Organizations account target, or None for an OU / root target.
+
+    Targets arrive as ARNs and occasionally as a bare account id. Note the resource separator
+    is a colon, not a slash:
+        arn:aws:organizations::<mgmt>:account/<org-id>/<account-id>   -> the account id
+        arn:aws:organizations::<mgmt>:ou/<org-id>/<ou-id>             -> None
+    """
+    t = str(target or "")
+    if t.isdigit() and len(t) == 12:
+        return t
+    resource = t.rsplit(":", 1)[-1]
+    if not resource.startswith("account/"):
+        return None
+    tail = resource.rsplit("/", 1)[-1]
+    return tail if tail.isdigit() and len(tail) == 12 else None
+
+
 def _error_code(e: Exception) -> str:
     """Best-effort AWS error code for a botocore exception ('' if not a ClientError)."""
     if isinstance(e, ClientError):
@@ -1741,10 +1813,14 @@ def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
 # SERVICE-LINKED-ROLE, CLOUDWATCH) are intentionally NOT asserted here to avoid false
 # positives on a healthy landing zone.
 _EXPECTED_STACKSETS = [
-    "AWSControlTowerExecutionRole",
     "AWSControlTowerBP-BASELINE-ROLES",
     "AWSControlTowerBP-BASELINE-SERVICE-ROLES",
 ]
+# Deliberately NOT asserted here: "AWSControlTowerExecutionRole". StackSet presence is the wrong
+# proxy for what actually matters, which is whether the AWSControlTowerExecution role exists and
+# is assumable in each enrolled account. The StackSet can be deleted with stacks retained (roles
+# survive, nothing is wrong) or absent because the roles were created another way, so its absence
+# produces a false warning. check_member_execution_roles tests the role directly instead.
 
 
 def check_expected_stacksets(ctx: Context, report: Report) -> None:
@@ -2087,7 +2163,11 @@ def check_member_execution_roles(ctx: Context, report: Report) -> None:
                            "unavailable) or an SCP/permission boundary. Verify before upgrading.",
                            cols=["Account", "Name", "Error"], rows=not_assumable,
                            remediation="Confirm the AWSControlTowerExecution role exists and is "
-                                       "assumable; if it is role drift, repair via Reset/Re-register."))
+                                       "assumable. Deletion of this role is drift to resolve "
+                                       "immediately. Control Tower offers role drift repair, which "
+                                       "restores a required role without a full landing-zone "
+                                       f"repair; see {DOC}/roles-how.html. Otherwise repair via "
+                                       "Reset/Re-register."))
     else:
         report.add(Finding("member_roles", PASS,
                            f"{ctx.member_role} assumable in all {checked} enrolled member account(s)"))
