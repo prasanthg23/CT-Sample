@@ -11,8 +11,19 @@
 
 A **read-only** command-line tool that you run **before** updating, repairing, or resetting an
 AWS Control Tower landing zone. It confirms the environment is in a known-good state and reports
-the issues, drift, out-of-band changes, and customizations that are the documented causes of
-landing-zone update failures — **so you can fix them first and reduce failed upgrades.**
+the issues, drift, out-of-band changes, and customizations that can interfere with a
+landing-zone update — **so you can fix them first and reduce failed upgrades.**
+
+Some checks map directly to a documented cause of update failure: AWS Control Tower names
+[three](https://docs.aws.amazon.com/controltower/latest/userguide/troubleshooting.html)
+(prerequisites not met, AWS Config resources in the Security OU accounts, and closed accounts
+that still hold a provisioned product), plus the
+[version 4.0 prerequisites](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html).
+The remaining checks are health and readiness conditions that are documented as drift or as
+repair scenarios, but are **not** documented as blocking an update — they are included because
+they are worth knowing before you start, and their severities reflect that distinction. See
+[What it checks](#what-it-checks) for the per-check severity model and
+[Limitations and scope](#limitations-and-scope).
 
 Updating a landing zone is meant to be routine, but
 [AWS Control Tower does not roll back to a previous landing zone version if an update fails](https://docs.aws.amazon.com/controltower/latest/userguide/troubleshooting.html)
@@ -70,7 +81,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 3 | Update availability | Version currency and delta | `controltower:GetLandingZone` (`version`, `latestAvailableVersion`) | INFO |
 | 4 | Managed accounts | `SUSPENDED` accounts in the org | `organizations:ListAccounts` | WARNING |
 | 5 | Orphaned provisioned products | Suspended account still holding an Account Factory product (→ `AWSControlTowerExecution` can't be assumed) | `organizations:ListAccounts` + `servicecatalog:SearchProvisionedProducts` | BLOCKER |
-| 6 | Enabled controls drift | Drifted / non-`SUCCEEDED` controls across every registered OU | `organizations` (OU discovery) + `controltower:ListEnabledControls` | BLOCKER |
+| 6 | Enabled controls drift | Drifted / non-`SUCCEEDED` controls across every registered OU. WARNING, not a blocker: control drift is a [repairable change](https://docs.aws.amazon.com/controltower/latest/userguide/drift.html), absent from the documented list of drift to resolve right away, and resolved with `ResetEnabledControl` or by re-registering the OU | `organizations` (OU discovery) + `controltower:ListEnabledControls` | WARNING |
 | 7 | Enabled baselines drift | Drifted / non-`SUCCEEDED` baselines. Severity depends on the target: a service-integration account (management / Audit / Log archive) is a BLOCKER because a landing-zone update acts on it; a member account or OU is a WARNING, because [enrolled accounts are updated separately](https://docs.aws.amazon.com/controltower/latest/userguide/update-existing-accounts.html) and that is repairable drift. `Not Applicable` / `Not Enabled` are [expected in 4.0](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html) and never reported | `controltower:ListEnabledBaselines` (`includeChildren=true`) | BLOCKER / WARNING |
 | 8 | StackSet health | `AWSControlTower*` stack instances INOPERABLE/FAILED/DRIFTED. Only **shared-account** (mgmt/audit/log-archive) instances block; **member-account** instances are WARNING; instances for **departed accounts** are INFO. OUTDATED is INFO (normal before an update). | `cloudformation:ListStackSets` / `ListStackInstances` | BLOCKER / WARNING / INFO |
 | 9 | AWS Config in shared accounts | Config recorders **or delivery channels** in Audit & Log Archive (across governed Regions) that Control Tower did not create — identified by name (`aws-controltower-*`), so a **single** pre-existing customer recorder in a newly governed Region is caught | `sts:AssumeRole` + `config:DescribeConfigurationRecorders` / `DescribeDeliveryChannels` | WARNING |

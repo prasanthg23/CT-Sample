@@ -653,13 +653,23 @@ def check_enabled_controls(ctx: Context, report: Report) -> None:
                            cols=["OU", "Control", "Status"], rows=no_status))
     if drifted or failed:
         rows = drifted + failed
-        report.add(Finding("controls_drift", BLOCKER,
+        report.add(Finding("controls_drift", WARNING,
                            f"{len(rows)} enabled control(s) drifted or not in SUCCEEDED state",
-                           "Drifted or failed controls should be reset before an upgrade so "
-                           "they re-baseline against the new landing zone version.",
+                           "Control drift is repairable drift, not drift to resolve right away. "
+                           "drift.html lists only four urgent types - deleting the Security OU, "
+                           "deleting a required management-account role, deleting all Additional "
+                           "OUs, and removing a shared account - and control drift is not among "
+                           "them. It is resolved with ResetEnabledControl or by re-registering the "
+                           "OU, and for a landing zone on 3.1 or later \"drift is resolved as part "
+                           "of the update process\". So this does not block the update. It does "
+                           "need resolving: a drifted control is not enforcing what you think it "
+                           "is, and while the landing zone is drifted the Enroll account feature "
+                           "will not work.",
                            cols=["OU", "Control", "Status"], rows=rows,
-                           remediation="reset-enabled-control / re-register OU. See "
-                                       f"{DOC}/drift.html"))
+                           remediation="Call ResetEnabledControl for the affected control, or "
+                                       "re-register the OU. If the drift is on the Security OU or "
+                                       "involves a required role or shared account, treat it as "
+                                       f"urgent instead. See {DOC}/drift.html"))
     else:
         report.add(Finding("controls_drift", PASS,
                            f"All enabled controls SUCCEEDED and IN_SYNC across {checked} OU(s)"

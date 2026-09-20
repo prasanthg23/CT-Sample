@@ -153,7 +153,9 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_suspended_with_provisioned_product, ctx)))
 
     # 6. enabled controls drift ----------------------------------------------------
-    def test_enabled_controls_drift_blocks(self):
+    def test_enabled_controls_drift_warns_not_blocks(self):
+        # Control drift is a documented repairable change, absent from drift.html's
+        # "resolve right away" list, so it must not block the update.
         orgs = FakeClient({
             "list_roots": {"Roots": [{"Id": "r-root"}]},
             "list_organizational_units_for_parent":
@@ -165,7 +167,9 @@ class TestBlockerPaths(unittest.TestCase):
              "driftStatusSummary": {"driftStatus": "DRIFTED"},
              "statusSummary": {"status": "SUCCEEDED"}}]}})
         ctx = make_ctx({"organizations": orgs, "controltower": ctl})
-        self.assertIn(ct.BLOCKER, levels(_run(ct.check_enabled_controls, ctx)))
+        lv = levels(_run(ct.check_enabled_controls, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
 
     # 7. enabled baselines drift/failed --------------------------------------------
     def test_enabled_baselines_failed_blocks(self):
