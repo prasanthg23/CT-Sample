@@ -1,7 +1,7 @@
 # AWS Control Tower Pre-Upgrade Precheck
 
 ![AWS](https://img.shields.io/badge/AWS-Control%20Tower-orange)
-![Language](https://img.shields.io/badge/python-3.8%2B-blue)
+![Language](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Access](https://img.shields.io/badge/access-read--only_by_default-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT--0-green)
 
@@ -14,12 +14,13 @@ AWS Control Tower landing zone. It confirms the environment is in a known-good s
 the issues, drift, out-of-band changes, and customizations that are the documented causes of
 landing-zone update failures — **so you can fix them first and reduce failed upgrades.**
 
-Updating a landing zone is meant to be routine, but the update **does not roll back** if it
-fails, and it can leave the landing zone in an indeterminate state. Most failures are caused by a
-small set of *detectable* preconditions (drift, suspended accounts with orphaned resources,
-lingering AWS Config resources, custom StackSet instances in new Regions, and so on). This tool
-checks for those preconditions and gates the upgrade with a non-zero exit code when it finds a
-blocker.
+Updating a landing zone is meant to be routine, but
+[AWS Control Tower does not roll back to a previous landing zone version if an update fails](https://docs.aws.amazon.com/controltower/latest/userguide/troubleshooting.html)
+— you may find your landing zone in an indeterminate state, and need AWS Support to recover it.
+Most failures are caused by a small set of *detectable* preconditions (drift, suspended accounts
+with orphaned resources, lingering AWS Config resources, custom StackSet instances in new Regions,
+and so on). This tool checks for those preconditions and gates the upgrade with a non-zero exit
+code when it finds a blocker.
 
 ## Table of Contents
 
@@ -84,6 +85,8 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 18 | In-progress StackSet operations | `RUNNING`/`STOPPING`/`QUEUED` operation on an `AWSControlTower*` StackSet (conflicts with the update) | `cloudformation:ListStackSetOperations` | BLOCKER |
 | 19 | Foundational StackSets present | Core `AWSControlTower*` StackSets entirely **missing** (broken / partially-deleted landing zone — repair, don't upgrade) | `cloudformation:ListStackSets` | WARNING |
 | 20 | Account Factory product health | Provisioned products in `ERROR`/`TAINTED` (inconsistent account — cannot update via Account Factory, can block controls on its OU; account-re-baselining issue, not an LZ-update blocker) or `UNDER_CHANGE`/`PLAN_IN_PROGRESS` (mid-flight) | `servicecatalog:SearchProvisionedProducts` | WARNING |
+| 21 | Upgrade-path considerations | Version-specific changes on the path from the deployed version to the target. For 4.0: the CloudTrail managed-policy prerequisite, the Security OU no longer being created, integrations becoming optional with baseline dependencies, the AWS Config scope change, drift notifications moving to EventBridge, and `CentralizedLogging` disable deleting logging-account resources | Version comparison only — no additional API calls | INFO |
+| 22 | Service-integration accounts share one parent OU | Landing zone 4.0 [requires all accounts configured for each service integration to be under the same parent OU](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html) — that OU becomes the designated Security OU, so a split across OUs is an unsupported layout. Evaluated when 4.0+ is deployed or available; explicitly disabled integrations are skipped, since a disabled integration names no account to place | `organizations:ListParents` | WARNING |
 
 **Opt-in deeper checks** (off by default — slower or heuristic; enable with a flag):
 
@@ -116,7 +119,8 @@ If it does not, the tool emits a WARNING (not a blocker).
 
 ## Prerequisites
 
-- Python 3.8+ and `boto3` (see [`requirements.txt`](requirements.txt)).
+- Python 3.9+ and `boto3` (see [`requirements.txt`](requirements.txt)). `boto3` itself requires
+  Python 3.9 or later, so 3.8 is not supported.
 - Credentials for the **Control Tower management account**, used in the **home Region**.
 - A read-only permission set covering the actions in the table above. Minimum policy:
 
@@ -326,7 +330,9 @@ This tool reduces upgrade failures; it does not guarantee success. Be aware of t
 
 - **Some failures only surface at deploy time.** Runtime issues — KMS key/permission edge cases,
   a blueprint entering `UPDATE_FAILED`, service throttling — cannot be predicted by a read-only
-  precheck. AWS Control Tower does not roll back a failed update, so always follow the
+  precheck.
+  [AWS Control Tower does not roll back a failed update](https://docs.aws.amazon.com/controltower/latest/userguide/troubleshooting.html),
+  so always follow the
   [best practices for landing zone updates](https://docs.aws.amazon.com/controltower/latest/userguide/lz-update-best-practices.html).
 - **`UNKNOWN` is not `PASS`.** If a permission is missing or an API errors, the affected check
   reports `UNKNOWN`. Treat unknowns as "must verify manually," and use `--strict` to gate on them.
