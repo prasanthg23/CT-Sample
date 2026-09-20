@@ -77,7 +77,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | # | Check | Detects | Data source (read-only) | Default severity |
 |---|-------|---------|-------------------------|------------------|
 | 1 | Landing zone status | `FAILED` / `PROCESSING` / mid-operation | `controltower:GetLandingZone` | BLOCKER |
-| 2 | Landing zone drift | Out-of-band change / managed-SCP modification / moved shared account | `controltower:GetLandingZone` (`driftStatus`) | BLOCKER |
+| 2 | Landing zone drift | [Landing-zone drift specifically](https://docs.aws.amazon.com/controltower/latest/userguide/governance-drift.html): IAM role drift, or organizational drift affecting Foundational OUs and shared accounts (deleted Foundational OU, trusted access disabled, audit / log archive account moved or removed). Most of these make Control Tower unusable until resolved. A managed-SCP modification is *account and OU* governance drift, not landing-zone drift, and is reported by checks 6 and 17 instead | `controltower:GetLandingZone` (`driftStatus`) | BLOCKER |
 | 3 | Update availability | Version currency and delta | `controltower:GetLandingZone` (`version`, `latestAvailableVersion`) | INFO |
 | 4 | Managed accounts | `SUSPENDED` accounts in the org | `organizations:ListAccounts` | WARNING |
 | 5 | Orphaned provisioned products | Suspended account still holding an Account Factory product (→ `AWSControlTowerExecution` can't be assumed) | `organizations:ListAccounts` + `servicecatalog:SearchProvisionedProducts` | BLOCKER |

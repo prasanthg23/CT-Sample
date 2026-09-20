@@ -366,12 +366,23 @@ def check_lz_drift(ctx: Context, report: Report) -> None:
     elif drift == "DRIFTED":
         report.add(Finding("lz_drift", BLOCKER,
                            "Landing zone is DRIFTED (out-of-band change detected)",
-                           "Landing-zone level drift as reported by GetLandingZone (driftStatus): a "
-                           "managed resource was modified/deleted or a shared account was moved. "
-                           "(Since Aug 2025, an SCP merely attached to a managed OU or member "
-                           "account is no longer counted as drift.)",
-                           remediation=f"Reset or update the landing zone to restore config. "
-                                       f"See {DOC}/drift.html"))
+                           "Landing-zone drift is narrower than account or control drift. It is "
+                           "defined as IAM role drift, or organizational drift that specifically "
+                           "affects Foundational OUs and shared accounts: a deleted Foundational "
+                           "OU, trusted access disabled, or the audit / log archive account moved "
+                           "or removed. Most of these leave Control Tower unusable until resolved "
+                           "- role drift makes the landing zone unavailable, deleting the Security "
+                           "OU blocks every other Control Tower action until a reset completes, and "
+                           "removing a shared account from a Foundational OU blocks the console. "
+                           "The exception is a MOVED shared account, which is resolved by updating "
+                           "the landing zone, so for that sub-type this upgrade is the fix rather "
+                           "than something to postpone. driftStatus alone does not say which "
+                           "sub-type applies. (Since Aug 2025, an SCP merely attached to a managed "
+                           "OU or member account is no longer counted as drift.)",
+                           remediation="Identify the drift sub-type in the Control Tower console. "
+                                       "Role drift has its own repair that restores the role "
+                                       "without a full landing-zone reset. Otherwise reset or "
+                                       f"update the landing zone. See {DOC}/governance-drift.html"))
     else:
         report.add(Finding("lz_drift", UNKNOWN,
                            f"Could not read landing zone drift status (got: {drift})"))
