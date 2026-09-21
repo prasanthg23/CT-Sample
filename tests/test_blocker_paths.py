@@ -1462,7 +1462,7 @@ class TestBaselineSeverityByTarget(unittest.TestCase):
     def test_member_account_warns_not_blocks(self):
         """The observed real case: a test account parked in an unmanaged OU reported FAILED,
         which previously failed an otherwise healthy landing zone with exit 2."""
-        lv = self._levels(self.ARN % "994180630136")
+        lv = self._levels(self.ARN % "333333333333")
         self.assertIn(ct.WARNING, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
@@ -1472,7 +1472,7 @@ class TestBaselineSeverityByTarget(unittest.TestCase):
         self.assertNotIn(ct.BLOCKER, lv)
 
     def test_member_drift_warns_not_blocks(self):
-        lv = self._levels(self.ARN % "994180630136", status="SUCCEEDED", drift="DRIFTED")
+        lv = self._levels(self.ARN % "333333333333", status="SUCCEEDED", drift="DRIFTED")
         self.assertIn(ct.WARNING, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
@@ -1495,7 +1495,7 @@ class TestBaselineSeverityByTarget(unittest.TestCase):
         ctl = FakeClient({"list_enabled_baselines": {"enabledBaselines": [
             {"targetIdentifier": self.ARN % "444444444444", "baselineVersion": "4.0",
              "statusSummary": {"status": "FAILED"}},
-            {"targetIdentifier": self.ARN % "994180630136", "baselineVersion": "4.0",
+            {"targetIdentifier": self.ARN % "333333333333", "baselineVersion": "4.0",
              "statusSummary": {"status": "FAILED"}}]}})
         lv = levels(_run(ct.check_enabled_baselines, make_ctx({"controltower": ctl})))
         self.assertEqual(lv, {ct.BLOCKER, ct.WARNING})
