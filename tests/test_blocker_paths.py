@@ -1760,5 +1760,87 @@ class TestIdentityCenterRegion(unittest.TestCase):
         self.assertIn("home Region", f[0].summary)
 
 
+class TestServiceIntegrationAccounts(unittest.TestCase):
+    """The manifest nests TWO Backup accounts under backup.configurations, so a flat
+    node.get("accountId") never finds them. That made the same-parent-OU check compare only a
+    subset of the integration accounts and still report PASS, and left those accounts out of the
+    severity-tiering set so a failure in one was downgraded to a member-account WARNING.
+    """
+
+    FULL = {
+        "centralizedLogging": {"accountId": "555555555555", "enabled": True},
+        "securityRoles": {"accountId": "444444444444", "enabled": True},
+        "config": {"accountId": "666666666666", "enabled": True},
+        "backup": {"enabled": True, "configurations": {
+            "backupAdmin": {"accountId": "777777777777"},
+            "centralBackup": {"accountId": "888888888888"},
+        }},
+    }
+
+    def test_all_five_accounts_found(self):
+        got = ct.service_integration_accounts(self.FULL)
+        self.assertEqual(set(got), {"555555555555", "444444444444", "666666666666",
+                                    "777777777777", "888888888888"})
+
+    def test_nested_backup_accounts_found(self):
+        got = ct.service_integration_accounts(self.FULL)
+        self.assertIn("777777777777", got)
+        self.assertIn("888888888888", got)
+        self.assertEqual(got["777777777777"], ["Backup admin"])
+        self.assertEqual(got["888888888888"], ["Central backup"])
+
+    def test_explicitly_disabled_integration_excluded(self):
+        """A disabled integration is no longer managed by Control Tower, so its accounts must
+        NOT be treated as ones a landing-zone operation acts on."""
+        m = dict(self.FULL, backup={"enabled": False, "configurations": {
+            "backupAdmin": {"accountId": "777777777777"}}})
+        got = ct.service_integration_accounts(m)
+        self.assertNotIn("777777777777", got)
+
+    def test_absent_enabled_flag_is_not_a_disable(self):
+        """Pre-4.0 manifests carry no enabled flags at all."""
+        got = ct.service_integration_accounts(
+            {"securityRoles": {"accountId": "444444444444"}})
+        self.assertEqual(set(got), {"444444444444"})
+
+    def test_shared_account_between_integrations_groups_labels(self):
+        got = ct.service_integration_accounts({
+            "centralizedLogging": {"accountId": "555555555555"},
+            "config": {"accountId": "555555555555"}})
+        self.assertEqual(set(got), {"555555555555"})
+        self.assertEqual(len(got["555555555555"]), 2)
+
+    def test_empty_manifest_yields_nothing(self):
+        self.assertEqual(ct.service_integration_accounts({}), {})
+
+    def test_backup_without_configurations_is_safe(self):
+        self.assertEqual(ct.service_integration_accounts({"backup": {"enabled": True}}), {})
+
+    def test_shared_accounts_property_includes_backup(self):
+        ctx = make_ctx(manifest=self.FULL)
+        self.assertEqual(
+            ctx.shared_accounts,
+            {"111111111111", "555555555555", "444444444444", "666666666666",
+             "777777777777", "888888888888"})
+
+    def test_shared_accounts_property_honours_overrides(self):
+        """--audit-account / --log-archive-account are applied after discovery."""
+        ctx = make_ctx(manifest={})
+        ctx.audit_account = "222222222222"
+        self.assertIn("222222222222", ctx.shared_accounts)
+
+    def test_baseline_failure_in_backup_account_now_blocks(self):
+        """Regression for the observed live case: a failure in the backupAdmin account was
+        classified as a member account and downgraded to WARNING."""
+        arn = "arn:aws:organizations::111111111111:account/o-a/777777777777"
+        ctl = FakeClient({"list_enabled_baselines": {"enabledBaselines": [
+            {"targetIdentifier": arn, "baselineVersion": "4.0",
+             "statusSummary": {"status": "FAILED"}}]}})
+        ctx = make_ctx({"controltower": ctl}, manifest=self.FULL)
+        lv = levels(_run(ct.check_enabled_baselines, ctx))
+        self.assertIn(ct.BLOCKER, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

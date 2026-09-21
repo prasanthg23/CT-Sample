@@ -220,6 +220,50 @@ def _collect(client, op: str, key: str, **kwargs) -> List[dict]:
 # --------------------------------------------------------------------------------------
 # Discovery: landing zone, governed regions, shared account ids (all from mgmt account)
 # --------------------------------------------------------------------------------------
+# Every service-integration account a landing zone manifest can declare, with the path to its
+# account id. The Backup integration nests TWO accounts under `configurations`, which is why a
+# flat node.get("accountId") does not find them.
+#   https://docs.aws.amazon.com/controltower/latest/userguide/lz-api-launch.html
+_SERVICE_INTEGRATION_ACCOUNTS = (
+    ("centralizedLogging", "CentralizedLogging (Log archive)", ("accountId",)),
+    ("securityRoles", "SecurityRoles (Audit)", ("accountId",)),
+    ("config", "Config", ("accountId",)),
+    ("backup", "Backup admin", ("configurations", "backupAdmin", "accountId")),
+    ("backup", "Central backup", ("configurations", "centralBackup", "accountId")),
+)
+
+
+def service_integration_accounts(manifest: Dict[str, Any]) -> Dict[str, List[str]]:
+    """{account id: [integration labels]} for every integration not EXPLICITLY disabled.
+
+    An explicitly disabled integration is excluded deliberately: "If a service integration
+    account displays a baseline status of 'Not Enabled' and the associated service integration
+    is disabled, AWS Control Tower no longer manages that account" (key-changes-lz-v4.html). An
+    account Control Tower has stopped managing must not be treated as one a landing-zone
+    operation acts on - doing so would invert the defect and produce a false blocker.
+
+    An ABSENT flag is not a disable. Manifests before 4.0 carry no `enabled` flags at all, so
+    absence means "declared and managed", the same reading used for the CloudTrail role gate.
+    """
+    out: Dict[str, List[str]] = {}
+    for key, label, path in _SERVICE_INTEGRATION_ACCOUNTS:
+        node = (manifest.get(key) or manifest.get(key[:1].upper() + key[1:]) or {})
+        if node.get("enabled") is False:
+            continue
+        cur: Any = node
+        for part in path[:-1]:
+            cur = cur.get(part) if isinstance(cur, dict) else None
+            if cur is None:
+                break
+        last = path[-1]
+        acct = None
+        if isinstance(cur, dict):
+            acct = cur.get(last) or cur.get(last[:1].upper() + last[1:])
+        if acct:
+            out.setdefault(str(acct), []).append(label)
+    return out
+
+
 class Context:
     def __init__(self, session, region: str, member_role: str):
         self.session = session
@@ -307,6 +351,22 @@ class Context:
         self.kms_key_arn = (cfg.get("kmsKeyArn") or cfg.get("KmsKeyArn")
                             or self.manifest.get("kmsKeyArn"))
         return True
+
+    @property
+    def shared_accounts(self) -> set:
+        """Accounts a landing-zone operation acts on, used for severity tiering.
+
+        The management account, plus every service-integration account the manifest declares and
+        does not explicitly disable. Control Tower "manages service integration accounts through
+        the landing zone, not through OU-level baselines" (key-changes-lz-v4.html), which is the
+        same reason the Audit and Log archive accounts sit here.
+
+        A property rather than a field so that the --audit-account / --log-archive-account
+        overrides, which are applied after discovery, are picked up without a second call.
+        """
+        accts = {self.mgmt_account, self.audit_account, self.log_archive_account}
+        accts |= set(service_integration_accounts(self.manifest))
+        return {a for a in accts if a}
 
     def assume(self, account_id: str, region: str, service: str):
         """Return a read-only service client in a member/shared account, or None."""
@@ -717,7 +777,7 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
                            "Could not list enabled baselines", str(e)))
         return
     # The accounts a landing-zone update actually acts on. Mirrors check_stacksets.
-    shared = {a for a in (ctx.mgmt_account, ctx.audit_account, ctx.log_archive_account) if a}
+    shared = ctx.shared_accounts
     shared_bad: List[List[str]] = []
     member_bad: List[List[str]] = []
     no_status: List[List[str]] = []
@@ -746,9 +806,10 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
         report.add(Finding("baselines_drift", BLOCKER,
                            f"{len(shared_bad)} baseline(s) unhealthy on a service-integration "
                            "account",
-                           "A landing-zone update acts on the management and service-integration "
-                           "(Audit / Log archive) accounts, so an unhealthy baseline on one of "
-                           "them must be resolved before updating.",
+                           "A landing-zone update acts on the management account and every "
+                           "service-integration account the manifest declares (Audit, Log archive, "
+                           "Config, Backup), so an unhealthy baseline on one of them must be "
+                           "resolved before updating.",
                            cols=["Target", "Version", "Status", "Drift"], rows=shared_bad,
                            remediation="Reset the landing zone, or reset the enabled baseline on "
                                        f"the affected target. See {DOC}/resolve-drift.html"))
@@ -789,7 +850,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
     # Shared/core accounts (management, log archive, audit) are what a landing-zone
     # update/repair/reset actually acts on; member accounts are updated separately
     # afterward (Re-register OU). So only shared-account instances are hard blockers.
-    shared = {a for a in (ctx.mgmt_account, ctx.audit_account, ctx.log_archive_account) if a}
+    shared = ctx.shared_accounts
 
     shared_bad, member_bad, outdated, orphaned = [], [], [], []
     skipped: List[List[str]] = []
@@ -830,9 +891,11 @@ def check_stacksets(ctx: Context, report: Report) -> None:
         report.add(Finding("stacksets", BLOCKER,
                            f"{len(shared_bad)} AWSControlTower* StackSet instance(s) inoperable/failed/"
                            "drifted in shared accounts",
-                           "INOPERABLE/FAILED or DRIFTED instances in the management, log archive, or "
-                           "audit accounts block the landing-zone update — those accounts are exactly "
-                           "what the update/repair/reset acts on.",
+                           "INOPERABLE/FAILED or DRIFTED instances in the management account or a "
+                           "service-integration account (Audit, Log archive, Config, Backup) block "
+                           "the landing-zone update — Control Tower manages those accounts through "
+                           "the landing zone, so they are exactly what the update/repair/reset "
+                           "acts on.",
                            cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=shared_bad,
                            remediation="Repair or remove (Retain Stacks) the affected shared-account "
                                        "instances before upgrading."))
@@ -960,7 +1023,7 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                 break
             time.sleep(10)
 
-    shared = {a for a in (ctx.mgmt_account, ctx.audit_account, ctx.log_archive_account) if a}
+    shared = ctx.shared_accounts
     shared_drifted, member_drifted, orphaned_drifted = [], [], []
     for name in names:
         try:
@@ -990,8 +1053,9 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                            f"{len(shared_drifted)} AWSControlTower* StackSet instance(s) DRIFTED in "
                            "shared accounts (out-of-band changes)",
                            "Active drift detection found resource-level drift in CT-deployed stacks in "
-                           "the management, log archive, or audit accounts — which the landing-zone "
-                           "update/repair/reset acts on. This can fail the update or revert changes. "
+                           "the management account or a service-integration account (Audit, Log "
+                           "archive, Config, Backup) — which the landing-zone update/repair/reset "
+                           "acts on. This can fail the update or revert changes. "
                            "The last column shows the drifted resource(s) when the role is assumable, "
                            "else where to look.",
                            cols=["StackSet", "Account", "Region", "Status", "Drift",
@@ -1380,13 +1444,11 @@ def check_cloudtrail_role_v4_policy(ctx: Context, report: Report) -> None:
                                        "detach the legacy inline policy."))
 
 
-# Manifest keys that name a service-integration account, with their display labels.
-_V4_INTEGRATIONS = (
-    ("centralizedLogging", "CentralizedLogging"),
-    ("securityRoles", "SecurityRoles"),
-    ("config", "Config"),
-    ("backup", "Backup"),
-)
+# Manifest keys that name a service-integration account are declared once, in
+# _SERVICE_INTEGRATION_ACCOUNTS near Context, together with the path to each account id. The
+# earlier flat form of this constant listed "backup" with no path and so never reached the two
+# accounts nested under backup.configurations, which made the same-parent-OU check compare only
+# a subset and still report PASS.
 
 
 # Baseline statuses that are EXPECTED rather than failures. In landing zone 4.0 the Control Tower
@@ -1495,23 +1557,13 @@ def check_v4_integration_accounts_same_ou(ctx: Context, report: Report) -> None:
     if latest is None or latest < 4:
         return  # 4.0 is not in play for this landing zone
 
-    accounts: List[List[str]] = []
-    for key, label in _V4_INTEGRATIONS:
-        node = (ctx.manifest.get(key)
-                or ctx.manifest.get(key[:1].upper() + key[1:])
-                or {})
-        if node.get("enabled") is False:
-            continue  # explicitly disabled -> no integration account to place
-        acct = node.get("accountId") or node.get("AccountId")
-        if acct:
-            accounts.append([label, acct])
-
     # One account can serve several integrations (Config and CentralizedLogging commonly share
-    # one), so group labels per account: what matters is how many distinct accounts there are
-    # and which OU each sits in, not how many integrations point at them.
-    by_account: Dict[str, List[str]] = {}
-    for label, acct in accounts:
-        by_account.setdefault(acct, []).append(label)
+    # one), so this is grouped per account: what matters is how many distinct accounts there are
+    # and which OU each sits in, not how many integrations point at them. Uses the shared
+    # extractor, which reaches the two Backup accounts nested under `configurations` - a flat
+    # node.get("accountId") silently missed them, so a landing zone with Backup enabled was
+    # reported as compliant having compared only two of its four integration accounts.
+    by_account = service_integration_accounts(ctx.manifest)
 
     if len(by_account) < 2:
         report.add(Finding("v4_integration_ou", PASS,
