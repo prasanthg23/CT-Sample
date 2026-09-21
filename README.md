@@ -235,7 +235,7 @@ python3 Source/ct_preupgrade_precheck.py
 # Explicit Region / named profile:
 python3 Source/ct_preupgrade_precheck.py --region us-east-1 --profile my-mgmt-admin
 
-# Emit a JSON report and treat WARNING/UNKNOWN as blocking (strict gate):
+# Emit a JSON report and also fail on WARNING (UNKNOWN already fails by default):
 python3 Source/ct_preupgrade_precheck.py --json report.json --strict
 
 # Override shared account discovery if the manifest lookup is unavailable:
@@ -321,7 +321,8 @@ RESULT: NOT SAFE TO UPGRADE — 2 blocker(s), 0 warning(s), 0 unverified.
 2. **Checks** — Runs each check independently. A check that errors is reported as `UNKNOWN`; it
    never crashes the run, so a single missing permission cannot hide the rest of the report.
 3. **Report + gate** — Prints a grouped report (and optional JSON), then exits non-zero if any
-   blocker (or, with `--strict`, any warning/unknown) is present.
+   blocker is present, or any `UNKNOWN` unless you pass `--allow-unknown`, or — with
+   `--strict` — any warning.
 
 ## Testing
 
@@ -349,7 +350,9 @@ This tool reduces upgrade failures; it does not guarantee success. Be aware of t
   so always follow the
   [best practices for landing zone updates](https://docs.aws.amazon.com/controltower/latest/userguide/lz-update-best-practices.html).
 - **`UNKNOWN` is not `PASS`.** If a permission is missing or an API errors, the affected check
-  reports `UNKNOWN`. Treat unknowns as "must verify manually," and use `--strict` to gate on them.
+  reports `UNKNOWN`. Unknowns gate the run **by default** — they mean "must verify manually," and
+  the exit code reflects that without any flag. Pass `--allow-unknown` only if you accept
+  proceeding on an unverified report.
 - **The Config check requires cross-account access.** Check #9 assumes a role
   (`AWSControlTowerExecution` by default) into the shared accounts; without it the check is
   `UNKNOWN`, not silently skipped.
